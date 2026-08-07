@@ -336,7 +336,15 @@ async def assess_damage(
     else:
         raw_detections = demo_detect_damage(image_bytes)
         cv_backend = "demo"
-    
+
+    # Mirror the Streamlit UI display normalization (title case) so the
+    # response content matches what the UI renders for the same image.
+    for d in raw_detections:
+        if d.get("severity"):
+            d["severity"] = d["severity"].capitalize()
+        if d.get("damage_type"):
+            d["damage_type"] = d["damage_type"].replace("_", " ").title()
+
     # Normalize detections
     damages = [
         DamageDetection(

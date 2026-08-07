@@ -6,6 +6,7 @@ from agentic.policy_loader import Policy, load_policy
 from agentic.schemas import Decision, DamageSignal
 from agentic.sop_retriever import load_sop_section
 from agentic.rag.simple_retriever import SimpleRetriever
+from agentic.adapters import pick_primary_detection, detection_to_damage_signal
 
 
 def _sig_get(signal, key: str, default=None):
@@ -117,3 +118,57 @@ class DecisionAgent:
             next_steps=next_steps or ["Request additional images and verify context."],
             evidence=sop_text[:1200] if sop_text else None,
         )
+
+
+def make_decision(damages: list[dict]) -> dict:
+    """API adapter: mirror the Streamlit UI decision path — normalize display
+    fields (title case), pick the primary detection, evaluate one policy signal."""
+    if not damages:
+        return {
+            "decision": "AUTO_APPROVE",
+            "confidence": 0.95,
+            "trace": [{
+                "rule_applied": "no_damage_detected",
+                "threshold": "damages == 0",
+                "evidence": "No visible damage detected.",
+            }],
+            "human_review_required": False,
+        }
+
+    normalized = []
+    for d in damages:
+        c = dict(d)
+        t = c.get("type") or c.get("damage_type") or ""
+        if c.get("severity"):
+            c["severity"] = c["severity"].capitalize()
+        if t:
+            c["type"] = t.replace("_", " ").title()
+        normalized.append(c)
+
+    primary = pick_primary_detection(normalized)
+    if primary is None:
+        return {
+            "decision": "HUMAN_REVIEW",
+            "confidence": 0.5,
+            "trace": [{
+                "rule_applied": "no_primary_detection",
+                "threshold": "damages > 0 but no valid detection",
+                "evidence": "No valid primary detection found.",
+            }],
+            "human_review_required": True,
+        }
+
+    signal = detection_to_damage_signal(primary)
+    agent = DecisionAgent(policies_dir=Path(__file__).resolve().parent.parent / "policies")
+    decision = agent.decide(signal)
+
+    return {
+        "decision": decision.action,
+        "confidence": signal["confidence"],
+        "trace": [{
+            "rule_applied": decision.reason,
+            "threshold": ", ".join(decision.policy_refs),
+            "evidence": decision.evidence or decision.reason,
+        }],
+        "human_review_required": decision.action != "AUTO_APPROVE",
+    }
