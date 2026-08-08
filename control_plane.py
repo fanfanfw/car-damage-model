@@ -53,6 +53,17 @@ class ControlPlaneUnavailable(Exception):
     """The control plane could not be reached or refused the request."""
 
 
+RATE_LIMIT_WINDOW_SECONDS = 60
+RATE_LIMIT_MAX_REQUESTS = 10_000
+SUPPORTED_RATE_LIMIT_CATEGORIES = frozenset({"assess"})
+
+
+@dataclass(frozen=True)
+class RateLimit:
+    requests: int
+    window_seconds: int
+
+
 @dataclass(frozen=True)
 class AuthResult:
     active: bool
@@ -60,6 +71,7 @@ class AuthResult:
     scopes: tuple = ()
     expires_at: str | None = None
     cache_ttl: int | None = None
+    rate_limits: dict | None = None
 
 
 @dataclass
@@ -101,6 +113,27 @@ class IntrospectionCache:
 
     def clear(self) -> None:
         self._data.clear()
+
+
+def _parse_rate_limits(value):
+    if value is None:
+        return None
+    if not isinstance(value, dict) or not value:
+        raise ControlPlaneUnavailable
+    parsed = {}
+    for category, spec in value.items():
+        if not isinstance(category, str) or category not in SUPPORTED_RATE_LIMIT_CATEGORIES or not isinstance(spec, dict) or set(spec) != {"requests", "window_seconds"}:
+            raise ControlPlaneUnavailable
+        requests = spec.get("requests")
+        window = spec.get("window_seconds")
+        if not isinstance(requests, int) or isinstance(requests, bool) or not isinstance(window, int) or isinstance(window, bool):
+            raise ControlPlaneUnavailable
+        if not 0 <= requests <= RATE_LIMIT_MAX_REQUESTS:
+            raise ControlPlaneUnavailable
+        if window != RATE_LIMIT_WINDOW_SECONDS:
+            raise ControlPlaneUnavailable
+        parsed[category] = RateLimit(requests=requests, window_seconds=window)
+    return parsed
 
 
 class AuthGateway:
@@ -186,12 +219,16 @@ class AuthGateway:
             isinstance(scope, str) for scope in scopes
         ):
             raise ControlPlaneUnavailable
+        cache_ttl = data.get("cache_ttl_seconds")
+        if cache_ttl is not None and (not isinstance(cache_ttl, int) or isinstance(cache_ttl, bool) or cache_ttl < 0):
+            raise ControlPlaneUnavailable
         return AuthResult(
             active=True,
             key_id=key_id,
             scopes=tuple(scopes),
             expires_at=data.get("expires_at"),
-            cache_ttl=data.get("cache_ttl_seconds"),
+            cache_ttl=cache_ttl,
+            rate_limits=_parse_rate_limits(data.get("rate_limits")),
         )
 
     def _effective_ttl(self, result: AuthResult) -> int:

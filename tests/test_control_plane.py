@@ -189,6 +189,58 @@ class TestAuthGatewayFailures:
             assert not result.active
 
 
+class TestIntrospectionContract:
+    def test_valid_rate_limits_are_parsed(self):
+        gateway = auth_gateway(lambda request: ok_response(rate_limits={"assess": {"requests": 10, "window_seconds": 60}}))
+        result = run(gateway.authenticate(KEY, "car-damage:assess"))
+        assert result.active
+        assert result.rate_limits["assess"].requests == 10
+        assert result.rate_limits["assess"].window_seconds == 60
+
+    def test_absent_rate_limits_are_tolerated(self):
+        gateway = auth_gateway(lambda request: ok_response())
+        result = run(gateway.authenticate(KEY, "car-damage:assess"))
+        assert result.active
+        assert result.rate_limits is None
+
+    def test_unknown_response_fields_are_tolerated(self):
+        gateway = auth_gateway(lambda request: ok_response(future_field={"anything": [1, 2, 3]}))
+        result = run(gateway.authenticate(KEY, "car-damage:assess"))
+        assert result.active
+        assert result.key_id == "11111111-2222-3333-4444-555555555555"
+
+    def test_malformed_rate_limits_fail_closed(self):
+        bad_values = [
+            "10",
+            {},
+            {"assess": "10"},
+            {"": {"requests": 10, "window_seconds": 60}},
+            {"unknown": {"requests": 10, "window_seconds": 60}},
+            {
+                "assess": {"requests": 10, "window_seconds": 60},
+                "submit": {"requests": 30, "window_seconds": 60},
+            },
+            {"assess": {"requests": 10}},
+            {"assess": {"window_seconds": 60}},
+            {"assess": {"requests": 10, "window_seconds": 60, "burst": 5}},
+            {"assess": {"requests": "10", "window_seconds": 60}},
+            {"assess": {"requests": 10, "window_seconds": "60"}},
+            {"assess": {"requests": 10, "window_seconds": 5}},
+            {"assess": {"requests": -1, "window_seconds": 60}},
+            {"assess": {"requests": 10_001, "window_seconds": 60}},
+            {"assess": {"requests": True, "window_seconds": 60}},
+        ]
+        for rate_limits in bad_values:
+            gateway = auth_gateway(lambda request, value=rate_limits: ok_response(rate_limits=value))
+            with pytest.raises(ControlPlaneUnavailable):
+                run(gateway.authenticate(KEY, "car-damage:assess"))
+
+    def test_malformed_cache_ttl_fails_closed(self):
+        gateway = auth_gateway(lambda request: ok_response(cache_ttl_seconds="5"))
+        with pytest.raises(ControlPlaneUnavailable):
+            run(gateway.authenticate(KEY, "car-damage:assess"))
+
+
 class TestUsageGateway:
     def usage_gateway(self, handler, **overrides):
         transport = httpx.MockTransport(handler)

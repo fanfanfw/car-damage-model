@@ -200,6 +200,32 @@ curl http://localhost:8000/health | python -m json.tool
 }
 ```
 
+### Managed API keys (control plane)
+
+`POST /assess` authenticates the `x-api-key` header against the Django
+API Key Management control plane (`apiKeyManagementFF`). Required env vars
+(see `.env.example`):
+
+- `SERVICE_ID=car-damage` and `SERVICE_CREDENTIAL` issued for that slug
+  (production required; 32-512 ASCII chars).
+- `CONTROL_PLANE_BASE_URL`: production plain-HTTP must be a Tailscale peer
+  (`100.64.0.0/10`) or the loopback-only internal listener
+  (`http://127.0.0.1:18083`).
+- `CONTROL_PLANE_INTROSPECT_TIMEOUT_SECONDS` (default `2`).
+- `AUTH_CACHE_MAX_TTL_SECONDS` (default `30`, max `30`): positive cache TTL is
+  `min(local, control-plane cache_ttl_seconds, remaining key expiry)`, so a
+  revoked key stops working within ~30 s.
+- `AUTH_CACHE_MAX_ENTRIES` (default `4096`); `USAGE_*` batch reporting knobs.
+
+Control-plane responses are backward compatible: unknown fields are tolerated,
+and malformed known fields fail closed (`503`). The contract also defines a
+`rate_limits` field: per-category `requests`/`window_seconds`, fixed 60 s
+window, category `assess` only. Absent is accepted (backward-compatible); an
+empty object, an unsupported category, or any spec that is not exactly
+`{"requests", "window_seconds"}` with integer values in bounds fails closed.
+The client parses this field defensively once the control plane starts
+emitting it.
+
 ---
 
 ## 🖥 Demo flow (Streamlit UI)
