@@ -1,0 +1,46 @@
+# Example systemd unit for the Car Damage Assessment API.
+# Preparation artifact only — NOT installed, NOT the active unit.
+# Apply with: sudo install -m 0644 this-file /etc/systemd/system/car-damage-api.service
+# then sudo systemctl daemon-reload (operator action, after network topology approval).
+
+[Unit]
+Description=Car Damage Assessment API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ifcon
+Group=ifcon
+WorkingDirectory=/home/ifcon/ff/car-damage-model
+# Secrets and tunables live in the environment file, never in the unit.
+EnvironmentFile=/home/ifcon/ff/car-damage-model/.env
+Environment=PYTHONUNBUFFERED=1
+# Bind strategy (pending operator approval of the network topology):
+#   - 127.0.0.1:18000  -> local cloudflared (public fanfanfw.biz.id) keeps working.
+#   - nginx (see car-damage-api.nginx.example.conf) listens on the Tailscale IP
+#     100.124.216.27:18000 for server-111 (car-damage.ifcontech.com).
+# --root-path /api keeps the OpenAPI `servers[0].url` = "/api" so the documented
+# request path is /api/assess while the application route stays /assess.
+ExecStart=/home/ifcon/ff/car-damage-model/.venv/bin/python -m uvicorn api:app \
+    --host 127.0.0.1 --port 18000 --root-path /api \
+    --proxy-headers --forwarded-allow-ips ${FORWARDED_ALLOW_IPS:-127.0.0.1,::1} \
+    --access-log
+Restart=always
+RestartSec=5
+
+# --- Hardening ---
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ifcon/ff/car-damage-model
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+UMask=0027
+
+# --- Minimum limits ---
+LimitNOFILE=4096
+LimitNPROC=512
+
+[Install]
+WantedBy=multi-user.target

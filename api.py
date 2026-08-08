@@ -1,70 +1,119 @@
 """
 Damage.ai — FastAPI Assessment Endpoint
 ========================================
-REST API layer for the Car Damage Assessment system.
-Accepts vehicle images, runs CV detection + policy engine,
-returns structured JSON with decision trace.
+REST API layer for the Car Damage Assessment system, protected by a managed
+``x-api-key`` validated against the Django API Key Management control plane.
+
+Security posture:
+- Only ``POST /assess`` requires the managed key (scope ``car-damage:assess``).
+- ``/docs``, ``/redoc``, ``/openapi.json``, ``/health*``, ``/policy`` are public.
+- Control plane unavailable, credential rejected, or key invalid/wrong-scope
+  fail closed: 401 for a bad/inactive key, 503 when the control plane cannot
+  authenticate the key. There is no local/legacy key fallback.
+- In production, model/decision failures return 503 (no demo result). A demo
+  fallback exists only in development and only when ``DEMO_FALLBACK_ENABLED``
+  is set explicitly.
 
 Usage:
-    uvicorn api:app --host 0.0.0.0 --port 8000 --reload
-
-Endpoint:
-    POST /assess  — upload image, get assessment result
-    GET  /health  — health check
-    GET  /policy  — current policy configuration
+    uvicorn api:app --host 127.0.0.1 --port 18000
 """
 
-import os
-import sys
-import uuid
-import time
+import asyncio
+import io
+import json
 import logging
-from datetime import datetime, timezone
+import re
+import sys
+import time
+import uuid
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Optional
 
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+
+load_dotenv()
+
+from fastapi import Depends, FastAPI, File, HTTPException, Request, Security, UploadFile  # noqa: E402
+from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
+from fastapi.responses import JSONResponse  # noqa: E402
+from fastapi.security import APIKeyHeader  # noqa: E402
+from pydantic import BaseModel, Field  # noqa: E402
+
+from control_plane import AuthGateway, ControlPlaneUnavailable, UsageGateway  # noqa: E402
+from settings import Settings, load_settings, parse_host  # noqa: E402
 
 # ---------------------------------------------------------------------------
-# Logging
+# Logging (redacting formatter as a safety net)
 # ---------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
-logger = logging.getLogger("damage_ai_api")
+
+_SENSITIVE = re.compile(r"(x-api-key|authorization|bearer|service_credential|api[_-]?key)\s*[:=]?\s*[^\s,;]+", re.I)
+
+
+class RedactingFormatter(logging.Formatter):
+    def format(self, record):
+        message = super().format(record)
+        return _SENSITIVE.sub("<redacted>", message)
+
+
+def _setup_logging() -> logging.Logger:
+    logger = logging.getLogger("damage_ai_api")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    if not logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(RedactingFormatter("%(asctime)s | %(levelname)s | %(message)s"))
+        logger.addHandler(handler)
+    return logger
+
+
+logger = _setup_logging()
 
 # ---------------------------------------------------------------------------
-# Ensure project root is on sys.path so we can import existing modules
+# Project root on sys.path
 # ---------------------------------------------------------------------------
+
 PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 # ---------------------------------------------------------------------------
-# Import existing project modules (graceful fallback if not available)
+# Optional model/decision modules (availability drives /health/ready)
 # ---------------------------------------------------------------------------
 try:
     from car_damage_detector import CarDamageDetector
+
     CV_AVAILABLE = True
     logger.info("CV detection module loaded successfully")
 except ImportError:
     CV_AVAILABLE = False
-    logger.warning("CV detection module not found — using demo detection")
+    logger.warning("CV detection module not found")
 
 try:
     from agentic.decision_agent import make_decision
+
     AGENT_AVAILABLE = True
     logger.info("Decision agent loaded successfully")
 except ImportError:
     AGENT_AVAILABLE = False
-    logger.warning("Decision agent not found — using demo decisioning")
+    logger.warning("Decision agent not found")
+
+ASSESS_SCOPE = "car-damage:assess"
+ASSESS_TEMPLATE = "/assess"
+CHUNK_SIZE = 64 * 1024
+MIN_IMAGE_BYTES = 1000
+
+ALLOWED_MIME = {"image/jpeg", "image/png", "image/webp"}
+ALLOWED_PIL_FORMATS = {"JPEG", "PNG", "WEBP"}
 
 # ---------------------------------------------------------------------------
 # Response models (Pydantic)
 # ---------------------------------------------------------------------------
 
+
 class DamageDetection(BaseModel):
     """Single detected damage instance."""
+
     damage_type: str = Field(..., description="Type of damage: scratch, dent, crack, shattered_glass, flat_tire, broken_lamp")
     confidence: float = Field(..., ge=0.0, le=1.0, description="Detection confidence score")
     severity: str = Field(..., description="Severity level: minor, moderate, severe")
@@ -72,13 +121,11 @@ class DamageDetection(BaseModel):
     bbox: list = Field(default_factory=list, description="Bounding box [x1, y1, x2, y2]")
     area_percentage: float = Field(0.0, description="Percentage of image area affected")
     estimated_cost: int = Field(0, description="Estimated repair cost in USD")
-    bbox: list = Field(default_factory=list, description="Bounding box [x1, y1, x2, y2]")
-    area_percentage: float = Field(0.0, description="Percentage of image area affected")
-    estimated_cost: int = Field(0, description="Estimated repair cost in USD")
 
 
 class DecisionTrace(BaseModel):
     """Explains why a specific decision was made."""
+
     rule_applied: str = Field(..., description="Which policy rule triggered the decision")
     threshold: str = Field(..., description="Threshold that was evaluated")
     evidence: str = Field(..., description="SOP or policy evidence supporting the decision")
@@ -86,49 +133,57 @@ class DecisionTrace(BaseModel):
 
 class AssessmentResult(BaseModel):
     """Full assessment response."""
+
     assessment_id: str = Field(..., description="Unique assessment identifier")
     timestamp: str = Field(..., description="ISO 8601 timestamp")
     processing_time_ms: int = Field(..., description="Total processing time in milliseconds")
-    
-    # Detection results
+
     damages_detected: list[DamageDetection] = Field(default_factory=list)
     total_damages: int = Field(0, description="Number of damages detected")
-    
-    # Decision
+
     decision: str = Field(..., description="AUTO_APPROVE | HUMAN_REVIEW | ESCALATE")
     decision_confidence: float = Field(..., ge=0.0, le=1.0)
     decision_trace: list[DecisionTrace] = Field(default_factory=list)
-    
-    # Metadata
+
     model_version: str = Field("demo-v0.1", description="CV model version used")
     policy_version: str = Field("v1.0", description="Policy version applied")
     cv_backend: str = Field("demo", description="CV backend: demo | yolov8 | custom")
     human_review_required: bool = Field(False)
 
 
-class HealthResponse(BaseModel):
-    status: str
-    version: str
-    cv_available: bool
-    agent_available: bool
-    uptime_seconds: float
+# ---------------------------------------------------------------------------
+# Domain exceptions
+# ---------------------------------------------------------------------------
+
+
+class UploadTooLarge(Exception):
+    pass
+
+
+class UploadInvalid(Exception):
+    pass
+
+
+class ModelUnavailable(Exception):
+    pass
+
+
+class DecisionUnavailable(Exception):
+    pass
 
 
 # ---------------------------------------------------------------------------
-# Demo detection (fallback when real CV module is not loaded)
+# Demo detection / decision (development-only, explicit flag)
 # ---------------------------------------------------------------------------
+
 
 def demo_detect_damage(image_bytes: bytes) -> list[dict]:
-    """
-    Demo detection — returns synthetic results based on image size.
-    This will be replaced by real YOLOv8 inference in Phase 2.
-    """
+    """Deterministic synthetic detection, used only with DEMO_FALLBACK_ENABLED."""
     import hashlib
-    
-    # Use image hash to generate deterministic but varied results
+
     img_hash = hashlib.md5(image_bytes).hexdigest()
     hash_int = int(img_hash[:8], 16)
-    
+
     damage_types = [
         ("scratch", "minor", "rear_bumper"),
         ("dent", "moderate", "front_door_left"),
@@ -137,315 +192,624 @@ def demo_detect_damage(image_bytes: bytes) -> list[dict]:
         ("dent", "moderate", "rear_quarter_panel"),
         ("shattered_glass", "severe", "headlight_left"),
     ]
-    
-    # Select 1-3 damages based on image hash
+
     num_damages = (hash_int % 3) + 1
     results = []
-    
     for i in range(num_damages):
         idx = (hash_int + i * 7) % len(damage_types)
         dtype, severity, location = damage_types[idx]
         confidence = round(0.65 + (((hash_int >> (i * 4)) % 30) / 100), 2)
         confidence = min(confidence, 0.98)
-        
-        results.append({
-            "damage_type": dtype,
-            "confidence": confidence,
-            "severity": severity,
-            "location": location,
-        })
-    
+        results.append(
+            {
+                "damage_type": dtype,
+                "confidence": confidence,
+                "severity": severity,
+                "location": location,
+            }
+        )
     return results
 
 
 def demo_make_decision(damages: list[dict]) -> dict:
-    """
-    Demo decision agent — applies simple rules.
-    This will be replaced by the real policy engine in Phase 2.
-    """
+    """Simple rule-based decision, used only with DEMO_FALLBACK_ENABLED."""
     if not damages:
         return {
             "decision": "AUTO_APPROVE",
             "confidence": 0.95,
-            "trace": [{
-                "rule_applied": "no_damage_detected",
-                "threshold": "damages == 0",
-                "evidence": "SOP: No visible damage → auto-approve"
-            }],
+            "trace": [{"rule_applied": "no_damage_detected", "threshold": "damages == 0", "evidence": "SOP: No visible damage → auto-approve"}],
             "human_review_required": False,
         }
-    
-    # Check for severe damage
     severe = [d for d in damages if d.get("severity") == "severe"]
     moderate = [d for d in damages if d.get("severity") == "moderate"]
-    
     if severe:
         return {
             "decision": "ESCALATE",
             "confidence": 0.90,
-            "trace": [{
-                "rule_applied": "severe_damage_escalation",
-                "threshold": "severity == severe",
-                "evidence": f"SOP: {len(severe)} severe damage(s) detected → escalate to senior assessor"
-            }],
+            "trace": [{"rule_applied": "severe_damage_escalation", "threshold": "severity == severe", "evidence": f"SOP: {len(severe)} severe damage(s) detected → escalate"}],
             "human_review_required": True,
         }
-    
     if len(moderate) >= 2:
         return {
             "decision": "HUMAN_REVIEW",
             "confidence": 0.80,
-            "trace": [{
-                "rule_applied": "multiple_moderate_review",
-                "threshold": "moderate_count >= 2",
-                "evidence": f"Policy: {len(moderate)} moderate damages → requires human review"
-            }],
+            "trace": [{"rule_applied": "multiple_moderate_review", "threshold": "moderate_count >= 2", "evidence": f"Policy: {len(moderate)} moderate damages → human review"}],
             "human_review_required": True,
         }
-    
     if moderate:
         return {
             "decision": "HUMAN_REVIEW",
             "confidence": 0.75,
-            "trace": [{
-                "rule_applied": "moderate_damage_review",
-                "threshold": "severity == moderate",
-                "evidence": "Policy: Moderate damage detected → human review recommended"
-            }],
+            "trace": [{"rule_applied": "moderate_damage_review", "threshold": "severity == moderate", "evidence": "Policy: Moderate damage detected → human review"}],
             "human_review_required": True,
         }
-    
-    # Only minor damages
     return {
         "decision": "AUTO_APPROVE",
         "confidence": 0.85,
-        "trace": [{
-            "rule_applied": "minor_only_approve",
-            "threshold": "all(severity == minor)",
-            "evidence": f"Policy: {len(damages)} minor damage(s) only → auto-approve within threshold"
-        }],
+        "trace": [{"rule_applied": "minor_only_approve", "threshold": "all(severity == minor)", "evidence": f"Policy: {len(damages)} minor damage(s) only → auto-approve"}],
         "human_review_required": False,
     }
 
 
 # ---------------------------------------------------------------------------
-# FastAPI app
+# Upload validation / hardening
 # ---------------------------------------------------------------------------
 
-APP_START_TIME = time.time()
 
-app = FastAPI(
-    title="Damage.ai — Vehicle Damage Assessment API",
-    description=(
-        "AI-powered vehicle damage assessment system. "
-        "Combines Computer Vision detection with deterministic policy-driven "
-        "decisioning and full decision trace for auditability."
-    ),
-    version="0.1.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
-)
-
-# CORS — allow all origins for development, restrict in production
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def _size_bucket(size: int) -> str:
+    if size < 64 * 1024:
+        return "lt64k"
+    if size < 512 * 1024:
+        return "lt512k"
+    if size < 4 * 1024 * 1024:
+        return "lt4m"
+    return "ge4m"
 
 
-# ---------------------------------------------------------------------------
-# Endpoints
-# ---------------------------------------------------------------------------
+async def read_upload_bounded(request: Request, upload: UploadFile, settings: Settings) -> bytes:
+    """Read the multipart file with a hard byte cap (never unbounded).
 
-@app.get("/health", response_model=HealthResponse, tags=["System"])
-async def health_check():
+    Content-Length is a cheap early 413; the bounded chunked read still runs
+    because Content-Length can be missing or forged.
     """
-    Health check endpoint. Returns system status and module availability.
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared = int(content_length)
+        except ValueError:
+            declared = 0
+        if declared > settings.max_upload_bytes:
+            raise UploadTooLarge
+
+    chunks = []
+    total = 0
+    while True:
+        chunk = await upload.read(CHUNK_SIZE)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > settings.max_upload_bytes:
+            raise UploadTooLarge
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def validate_image(data: bytes, settings: Settings) -> None:
+    """Validate that the bytes are a real JPEG/PNG/WebP within pixel limits.
+
+    Raises UploadInvalid for corrupt/truncated/spoofed content and for
+    decompression-bomb / oversized-pixel images.
     """
-    return HealthResponse(
-        status="healthy",
-        version="0.1.0",
-        cv_available=CV_AVAILABLE,
-        agent_available=AGENT_AVAILABLE,
-        uptime_seconds=round(time.time() - APP_START_TIME, 1),
+    if len(data) < MIN_IMAGE_BYTES:
+        raise UploadInvalid("Image file is too small or empty.")
+    try:
+        from PIL import Image
+
+        original = Image.MAX_IMAGE_PIXELS
+        Image.MAX_IMAGE_PIXELS = settings.max_image_pixels
+        try:
+            with Image.open(io.BytesIO(data)) as image:
+                image.verify()
+                fmt = image.format
+            if fmt not in ALLOWED_PIL_FORMATS:
+                raise UploadInvalid("Image file is corrupt or unsupported.")
+            with Image.open(io.BytesIO(data)) as image:
+                width, height = image.size
+        finally:
+            Image.MAX_IMAGE_PIXELS = original
+    except UploadInvalid:
+        raise
+    except Exception:
+        raise UploadInvalid("Image file is corrupt or unsupported.") from None
+    if (
+        width > settings.max_image_dimension
+        or height > settings.max_image_dimension
+        or width * height > settings.max_image_pixels
+    ):
+        raise UploadInvalid("Image exceeds the allowed pixel dimensions.")
+
+
+# ---------------------------------------------------------------------------
+# Auth / usage middleware
+# ---------------------------------------------------------------------------
+
+
+async def _plain_json(send, status_code: int, body: dict) -> None:
+    payload = json.dumps(body, separators=(",", ":")).encode("utf-8")
+    await send(
+        {
+            "type": "http.response.start",
+            "status": status_code,
+            "headers": [(b"content-type", b"application/json")],
+        }
     )
+    await send({"type": "http.response.body", "body": payload})
 
 
-@app.post("/assess", response_model=AssessmentResult, tags=["Assessment"])
-async def assess_damage(
-    image: UploadFile = File(..., description="Vehicle image (JPEG/PNG)"),
-):
-    """
-    **Main assessment endpoint.**
-    
-    Upload a vehicle image → get structured damage assessment with:
-    - Detected damages (type, severity, location, confidence)
-    - Policy-based decision (AUTO_APPROVE / HUMAN_REVIEW / ESCALATE)
-    - Full decision trace explaining *why* the decision was made
-    
-    The response includes all information needed for audit compliance.
-    """
-    start_time = time.time()
-    assessment_id = str(uuid.uuid4())[:12]
-    
-    # Validate file type
-    if image.content_type not in ("image/jpeg", "image/png", "image/webp"):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported image type: {image.content_type}. Use JPEG, PNG, or WebP."
-        )
-    
-    # Read image bytes
-    image_bytes = await image.read()
-    if len(image_bytes) < 1000:
-        raise HTTPException(status_code=400, detail="Image file is too small or empty.")
-    if len(image_bytes) > 20 * 1024 * 1024:  # 20MB limit
-        raise HTTPException(status_code=400, detail="Image file exceeds 20MB limit.")
-    
-    logger.info(f"[{assessment_id}] Processing image: {image.filename} ({len(image_bytes)} bytes)")
-    
-    # Step 1: Damage detection
+def _app_path(scope) -> str:
+    path = scope.get("path", "")
+    root = scope.get("root_path") or ""
+    if root and path.startswith(root):
+        path = path[len(root):]
+    return path or "/"
+
+
+class TrustedHostMiddleware:
+    def __init__(self, app, state):
+        self.app = app
+        self.state = state
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] not in ("http", "websocket"):
+            return await self.app(scope, receive, send)
+        settings: Settings = self.state.settings
+        host_values = [value for name, value in scope["headers"] if name.lower() == b"host"]
+        host = None
+        if len(host_values) == 1:
+            try:
+                host = parse_host(host_values[0].decode("ascii"))
+            except (UnicodeDecodeError, ValueError):
+                host = None
+        if host is None or host not in set(settings.allowed_hosts):
+            return await _plain_json(send, 400, {"detail": "Invalid host header"})
+        return await self.app(scope, receive, send)
+
+
+class AssessAuthMiddleware:
+    """Authenticates the managed x-api-key for POST /assess only."""
+
+    def __init__(self, app, state):
+        self.app = app
+        self.state = state
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        path = _app_path(scope)
+        if scope["method"] != "POST" or path != ASSESS_TEMPLATE:
+            return await self.app(scope, receive, send)
+
+        values = [value for name, value in scope["headers"] if name.lower() == b"x-api-key"]
+        if not values:
+            return await _plain_json(send, 401, {"detail": "Missing x-api-key header."})
+        if len(values) != 1:
+            return await _plain_json(send, 401, {"detail": "Invalid API key."})
+        try:
+            api_key = values[0].decode("ascii")
+        except UnicodeDecodeError:
+            api_key = ""
+
+        gateway: AuthGateway | None = self.state.auth_gateway
+        if gateway is None:
+            return await _plain_json(send, 503, {"detail": "Assessment service unavailable."})
+        try:
+            result = await gateway.authenticate(api_key, ASSESS_SCOPE)
+        except ControlPlaneUnavailable:
+            return await _plain_json(send, 503, {"detail": "Assessment service unavailable."})
+        if not result.active or not result.key_id or ASSESS_SCOPE not in result.scopes:
+            return await _plain_json(send, 401, {"detail": "Invalid API key."})
+        try:
+            uuid.UUID(result.key_id)
+        except (ValueError, AttributeError, TypeError):
+            return await _plain_json(send, 503, {"detail": "Assessment service unavailable."})
+        scope["api_key_id"] = result.key_id
+        return await self.app(scope, receive, send)
+
+
+class UsageRecordingMiddleware:
+    """Records /assess usage after the response; never logs sensitive payloads."""
+
+    def __init__(self, app, state):
+        self.app = app
+        self.state = state
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        path = _app_path(scope)
+        if scope["method"] != "POST" or path != ASSESS_TEMPLATE:
+            return await self.app(scope, receive, send)
+        started = time.monotonic()
+        status_code = None
+
+        async def wrapped_send(message):
+            nonlocal status_code
+            if message["type"] == "http.response.start" and status_code is None:
+                status_code = message["status"]
+            await send(message)
+
+        await self.app(scope, receive, wrapped_send)
+        key_id = scope.get("api_key_id")
+        if status_code is None or not key_id:
+            return
+        gateway: UsageGateway | None = self.state.usage_gateway
+        if gateway is None:
+            return
+        latency_ms = int(round((time.monotonic() - started) * 1000))
+        gateway.record(key_id, scope["method"], ASSESS_TEMPLATE, f"{status_code // 100}xx", latency_ms)
+
+
+# ---------------------------------------------------------------------------
+# App factory
+# ---------------------------------------------------------------------------
+
+API_KEY_HEADER = APIKeyHeader(name="x-api-key", auto_error=False, description="Managed API key issued by the control-plane dashboard.")
+
+
+def require_managed_key(request: Request, _: str | None = Security(API_KEY_HEADER)) -> str:
+    """OpenAPI-facing dependency; the real check runs in AssessAuthMiddleware."""
+    key_id = request.scope.get("api_key_id")
+    if not key_id:
+        raise HTTPException(status_code=401, detail="Invalid API key.")
+    return key_id
+
+
+def _demo_enabled(settings: Settings) -> bool:
+    return settings.environment != "production" and settings.demo_fallback_enabled
+
+
+def _patch_openapi(application: FastAPI) -> None:
+    original = application.openapi
+
+    def patched_openapi() -> dict:
+        schema = original()
+        schemes = schema.setdefault("components", {}).setdefault("securitySchemes", {})
+        header = schemes.get("APIKeyHeader")
+        if header is not None:
+            header["description"] = (
+                "Managed API key sent in the 'x-api-key' header. Issued by the "
+                "control-plane dashboard for service `car-damage`; never commit "
+                "keys or put them in client-side JavaScript. 401 for missing, "
+                "invalid, inactive, or wrong-scope keys; 503 when the control "
+                "plane cannot be reached."
+            )
+        return schema
+
+    application.openapi = patched_openapi
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    state = app.state._cd
+    if state.auth_gateway is None:
+        state.auth_gateway = AuthGateway(state.settings)
+    if state.usage_gateway is None:
+        state.usage_gateway = UsageGateway(state.settings)
+    await state.usage_gateway.start()
+    logger.info("car-damage api started (environment=%s)", state.settings.environment)
+    try:
+        yield
+    finally:
+        await state.usage_gateway.stop()
+        state.auth_gateway = None
+        state.usage_gateway = None
+
+
+async def _run_detection(image_bytes: bytes, settings: Settings, assessment_id: str, request_id: str) -> tuple[list[dict], str]:
+    """Run CV detection; returns (detections, cv_backend)."""
     if CV_AVAILABLE:
         try:
             from PIL import Image as PILImage
-            import io
+
             detector = CarDamageDetector(confidence_threshold=0.25)
             pil_img = PILImage.open(io.BytesIO(image_bytes))
             result = detector.detect_damage(pil_img)
-            raw_detections_raw = result.get('damages', [])
-            # Normalize keys for API response
-            raw_detections = []
-            for det in raw_detections_raw:
-                raw_detections.append({
-                    'damage_type': det.get('type', det.get('damage_type', 'unknown')),
-                    'confidence': det.get('confidence', 0.5),
-                    'severity': det.get('severity', 'minor'),
-                    'location': det.get('location', 'unknown'),
-                    'bbox': det.get('bbox', []),
-                    'area_percentage': det.get('area_percentage', 0),
-                    'estimated_cost': det.get('estimated_cost', 0),
-                })
-            cv_backend = "model-backed"
-        except Exception as e:
-            logger.error(f"[{assessment_id}] CV detection failed: {e}, falling back to demo")
-            raw_detections = demo_detect_damage(image_bytes)
-            cv_backend = "demo-fallback"
-    else:
-        raw_detections = demo_detect_damage(image_bytes)
-        cv_backend = "demo"
+            raw = result.get("damages", [])
+            detections = []
+            for det in raw:
+                detections.append(
+                    {
+                        "damage_type": det.get("type", det.get("damage_type", "unknown")),
+                        "confidence": det.get("confidence", 0.5),
+                        "severity": det.get("severity", "minor"),
+                        "location": det.get("location", "unknown"),
+                        "bbox": det.get("bbox", []),
+                        "area_percentage": det.get("area_percentage", 0),
+                        "estimated_cost": det.get("estimated_cost", 0),
+                    }
+                )
+            return detections, "model-backed"
+        except Exception:
+            logger.warning(
+                "assess_event request_id=%s assessment_id=%s category=detection_failure",
+                request_id,
+                assessment_id,
+            )
+            if _demo_enabled(settings):
+                return demo_detect_damage(image_bytes), "demo-fallback"
+            raise ModelUnavailable from None
+    if _demo_enabled(settings):
+        return demo_detect_damage(image_bytes), "demo"
+    logger.warning(
+        "assess_event request_id=%s assessment_id=%s category=model_unavailable",
+        request_id,
+        assessment_id,
+    )
+    raise ModelUnavailable
 
-    # Mirror the Streamlit UI display normalization (title case) so the
-    # response content matches what the UI renders for the same image.
-    for d in raw_detections:
-        if d.get("severity"):
-            d["severity"] = d["severity"].capitalize()
-        if d.get("damage_type"):
-            d["damage_type"] = d["damage_type"].replace("_", " ").title()
 
-    # Normalize detections
-    damages = [
-        DamageDetection(
-            damage_type=d.get("damage_type", "unknown"),
-            confidence=d.get("confidence", 0.5),
-            severity=d.get("severity", "minor"),
-            location=d.get("location", "unknown"),
-            bbox=d.get("bbox", []),
-            area_percentage=d.get("area_percentage", 0.0),
-            estimated_cost=d.get("estimated_cost", 0),
-        )
-        for d in raw_detections
-    ]
-    
-    # Step 2: Decision agent
+async def _run_decision(damages: list[dict], settings: Settings, assessment_id: str, request_id: str) -> tuple[dict, str]:
+    """Run the decision agent; returns (decision_result, policy_version)."""
     if AGENT_AVAILABLE:
         try:
-            decision_result = make_decision(raw_detections)
-            policy_version = "v1.0-production"
-        except Exception as e:
-            logger.error(f"[{assessment_id}] Decision agent failed: {e}, falling back to demo")
-            decision_result = demo_make_decision(raw_detections)
-            policy_version = "v1.0-demo-fallback"
-    else:
-        decision_result = demo_make_decision(raw_detections)
-        policy_version = "v1.0-demo"
-    
-    # Build trace
-    traces = [
-        DecisionTrace(
-            rule_applied=t.get("rule_applied", "unknown"),
-            threshold=t.get("threshold", ""),
-            evidence=t.get("evidence", ""),
+            return make_decision(damages), "v1.0-production"
+        except Exception:
+            logger.warning(
+                "assess_event request_id=%s assessment_id=%s category=decision_failure",
+                request_id,
+                assessment_id,
+            )
+            if _demo_enabled(settings):
+                return demo_make_decision(damages), "v1.0-demo-fallback"
+            raise DecisionUnavailable from None
+    if _demo_enabled(settings):
+        return demo_make_decision(damages), "v1.0-demo"
+    logger.warning(
+        "assess_event request_id=%s assessment_id=%s category=decision_unavailable",
+        request_id,
+        assessment_id,
+    )
+    raise DecisionUnavailable
+
+
+def create_app(*, settings: Settings | None = None, auth_gateway=None, usage_gateway=None) -> FastAPI:
+    settings = settings if settings is not None else load_settings()
+
+    application = FastAPI(
+        title="Damage.ai — Vehicle Damage Assessment API",
+        description=(
+            "AI-powered vehicle damage assessment system. "
+            "POST /assess requires a managed `x-api-key` (scope car-damage:assess). "
+            "Uploads are limited to JPEG/PNG/WebP within documented size and pixel "
+            "bounds. Error semantics: 401 invalid/inactive key, 413 oversized "
+            "upload, 503 assessment or control plane unavailable."
+        ),
+        version="0.2.0",
+        docs_url="/docs" if settings.api_docs_enabled else None,
+        redoc_url="/redoc" if settings.api_docs_enabled else None,
+        openapi_url="/openapi.json" if settings.api_docs_enabled else None,
+        lifespan=lifespan,
+    )
+
+    class _State:
+        pass
+
+    state = _State()
+    state.settings = settings
+    state.auth_gateway = auth_gateway
+    state.usage_gateway = usage_gateway
+    state.assess_semaphore = asyncio.Semaphore(settings.max_concurrent_assessments)
+    application.state._cd = state
+
+    application.add_middleware(UsageRecordingMiddleware, state=state)
+    application.add_middleware(AssessAuthMiddleware, state=state)
+    application.add_middleware(TrustedHostMiddleware, state=state)
+    if settings.cors_allowed_origins:
+        application.add_middleware(
+            CORSMiddleware,
+            allow_origins=list(settings.cors_allowed_origins),
+            allow_credentials=False,
+            allow_methods=["POST", "GET", "OPTIONS"],
+            allow_headers=["x-api-key", "content-type"],
         )
-        for t in decision_result.get("trace", [])
-    ]
-    
-    processing_time = int((time.time() - start_time) * 1000)
-    
-    logger.info(
-        f"[{assessment_id}] Done: {len(damages)} damages, "
-        f"decision={decision_result['decision']}, "
-        f"time={processing_time}ms"
-    )
-    
-    return AssessmentResult(
-        assessment_id=assessment_id,
-        timestamp=datetime.now(timezone.utc).isoformat(),
-        processing_time_ms=processing_time,
-        damages_detected=damages,
-        total_damages=len(damages),
-        decision=decision_result["decision"],
-        decision_confidence=decision_result.get("confidence", 0.5),
-        decision_trace=traces,
-        model_version="demo-v0.1" if cv_backend == "demo" else "yolov8-v0.1",
-        policy_version=policy_version,
-        cv_backend=cv_backend,
-        human_review_required=decision_result.get("human_review_required", False),
-    )
+
+    _register_routes(application)
+    _patch_openapi(application)
+    return application
 
 
-@app.get("/policy", tags=["Policy"])
-async def get_policy():
-    """
-    Returns the current policy configuration.
-    Shows what rules are active and how decisions are made.
-    """
-    policy_path = PROJECT_ROOT / "policies"
-    policies = {}
-    
-    if policy_path.exists():
-        for f in policy_path.glob("*.yaml"):
-            policies[f.stem] = str(f)
-        for f in policy_path.glob("*.yml"):
-            policies[f.stem] = str(f)
-    
-    return {
-        "policy_version": "v1.0",
-        "policy_files": policies,
-        "decision_types": ["AUTO_APPROVE", "HUMAN_REVIEW", "ESCALATE"],
-        "severity_levels": ["minor", "moderate", "severe"],
-        "rules_summary": {
-            "no_damage": "AUTO_APPROVE",
-            "minor_only": "AUTO_APPROVE",
-            "any_moderate": "HUMAN_REVIEW",
-            "multiple_moderate": "HUMAN_REVIEW",
-            "any_severe": "ESCALATE",
+def _register_routes(application: FastAPI) -> None:
+    @application.get("/health/live", tags=["System"])
+    async def health_live():
+        """Process liveness. Always 200 when the process is up."""
+        return {"status": "ok"}
+
+    @application.get("/health/ready", tags=["System"])
+    async def health_ready():
+        """Readiness: model and decision policy must be available."""
+        if CV_AVAILABLE and AGENT_AVAILABLE:
+            return {"status": "ready"}
+        return JSONResponse(status_code=503, content={"status": "not_ready"})
+
+    @application.get("/health", tags=["System"], deprecated=True)
+    async def health_legacy():
+        """Deprecated alias for /health/live."""
+        return {"status": "ok"}
+
+    @application.get("/policy", tags=["Policy"])
+    async def get_policy():
+        """Returns the current policy configuration (public)."""
+        policy_path = PROJECT_ROOT / "policies"
+        policy_names = []
+        if policy_path.exists():
+            for f in list(policy_path.glob("*.yaml")) + list(policy_path.glob("*.yml")):
+                policy_names.append(f.name)
+        return {
+            "policy_version": "v1.0",
+            "policy_files": policy_names,
+            "decision_types": ["AUTO_APPROVE", "HUMAN_REVIEW", "ESCALATE"],
+            "severity_levels": ["minor", "moderate", "severe"],
+            "rules_summary": {
+                "no_damage": "AUTO_APPROVE",
+                "minor_only": "AUTO_APPROVE",
+                "any_moderate": "HUMAN_REVIEW",
+                "multiple_moderate": "HUMAN_REVIEW",
+                "any_severe": "ESCALATE",
+            },
         }
-    }
+
+    @application.post(
+        "/assess",
+        response_model=AssessmentResult,
+        tags=["Assessment"],
+        responses={
+            401: {"description": "Missing, invalid, inactive, or wrong-scope API key."},
+            413: {"description": "Upload exceeds the configured byte limit."},
+            503: {"description": "Assessment or control plane unavailable."},
+        },
+    )
+    async def assess_damage(
+        request: Request,
+        image: UploadFile = File(..., description="Vehicle image (JPEG/PNG/WebP)"),
+        _: str = Depends(require_managed_key),
+    ):
+        """Upload a vehicle image → structured damage assessment.
+
+        Requires a managed `x-api-key` with scope `car-damage:assess`.
+        """
+        state = application.state._cd
+        settings: Settings = state.settings
+        request_id = str(uuid.uuid4())
+        assessment_id = str(uuid.uuid4())[:12]
+        start_time = time.monotonic()
+        size_bucket = None
+
+        try:
+            # Concurrency gate BEFORE reading the body so in-flight authenticated
+            # requests (and their ~20MB buffers) stay bounded by the semaphore.
+            try:
+                await asyncio.wait_for(state.assess_semaphore.acquire(), timeout=0.01)
+            except TimeoutError:
+                logger.warning(
+                    "assess_event request_id=%s assessment_id=%s category=concurrency_limit",
+                    request_id,
+                    assessment_id,
+                )
+                return JSONResponse(
+                    status_code=503,
+                    content={"detail": "Assessment service unavailable."},
+                    headers={"Retry-After": "5"},
+                )
+            try:
+                if image.content_type not in ALLOWED_MIME:
+                    raise UploadInvalid("Unsupported image type. Use JPEG, PNG, or WebP.")
+
+                image_bytes = await read_upload_bounded(request, image, settings)
+                validate_image(image_bytes, settings)
+                size_bucket = _size_bucket(len(image_bytes))
+
+                damages, cv_backend = await _run_detection(
+                    image_bytes, settings, assessment_id, request_id
+                )
+                decision_result, policy_version = await _run_decision(
+                    damages, settings, assessment_id, request_id
+                )
+            finally:
+                state.assess_semaphore.release()
+        except UploadTooLarge:
+            logger.warning(
+                "assess_event request_id=%s assessment_id=%s category=upload_oversized size_bucket=%s",
+                request_id,
+                assessment_id,
+                size_bucket,
+            )
+            return JSONResponse(status_code=413, content={"detail": "Image file exceeds the allowed size."})
+        except UploadInvalid as error:
+            logger.warning(
+                "assess_event request_id=%s assessment_id=%s category=upload_invalid",
+                request_id,
+                assessment_id,
+            )
+            return JSONResponse(status_code=400, content={"detail": str(error)})
+        except ModelUnavailable:
+            logger.warning(
+                "assess_event request_id=%s assessment_id=%s category=model_unavailable",
+                request_id,
+                assessment_id,
+            )
+            return JSONResponse(status_code=503, content={"detail": "Assessment service unavailable."})
+        except DecisionUnavailable:
+            logger.warning(
+                "assess_event request_id=%s assessment_id=%s category=decision_unavailable",
+                request_id,
+                assessment_id,
+            )
+            return JSONResponse(status_code=503, content={"detail": "Assessment service unavailable."})
+        finally:
+            await image.close()
+
+        # Mirror the Streamlit UI display normalization (title case) so the
+        # response content matches what the UI renders for the same image.
+        for d in damages:
+            if d.get("severity"):
+                d["severity"] = d["severity"].capitalize()
+            if d.get("damage_type"):
+                d["damage_type"] = d["damage_type"].replace("_", " ").title()
+
+        normalized = [
+            DamageDetection(
+                damage_type=d.get("damage_type", "unknown"),
+                confidence=d.get("confidence", 0.5),
+                severity=d.get("severity", "minor"),
+                location=d.get("location", "unknown"),
+                bbox=d.get("bbox", []),
+                area_percentage=d.get("area_percentage", 0.0),
+                estimated_cost=d.get("estimated_cost", 0),
+            )
+            for d in damages
+        ]
+
+        traces = [
+            DecisionTrace(
+                rule_applied=t.get("rule_applied", "unknown"),
+                threshold=t.get("threshold", ""),
+                evidence=t.get("evidence", ""),
+            )
+            for t in decision_result.get("trace", [])
+        ]
+
+        processing_time = int((time.monotonic() - start_time) * 1000)
+        logger.info(
+            "assess_event request_id=%s assessment_id=%s status_class=2xx "
+            "size_bucket=%s latency_ms=%d damages=%d cv_backend=%s",
+            request_id,
+            assessment_id,
+            size_bucket,
+            processing_time,
+            len(normalized),
+            cv_backend,
+        )
+
+        return AssessmentResult(
+            assessment_id=assessment_id,
+            timestamp=datetime.now(UTC).isoformat(),
+            processing_time_ms=processing_time,
+            damages_detected=normalized,
+            total_damages=len(normalized),
+            decision=decision_result["decision"],
+            decision_confidence=decision_result.get("confidence", 0.5),
+            decision_trace=traces,
+            model_version="demo-v0.1" if cv_backend == "demo" else "yolov8-v0.1",
+            policy_version=policy_version,
+            cv_backend=cv_backend,
+            human_review_required=decision_result.get("human_review_required", False),
+        )
 
 
-# ---------------------------------------------------------------------------
-# Run with: python api.py
-# ---------------------------------------------------------------------------
+app = create_app()
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(
-        "api:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
-        log_level="info",
-    )
+
+    uvicorn.run("api:app", host="127.0.0.1", port=18000, log_level="info")
