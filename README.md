@@ -216,6 +216,16 @@ API Key Management control plane (`apiKeyManagementFF`). Required env vars
   `min(local, control-plane cache_ttl_seconds, remaining key expiry)`, so a
   revoked key stops working within ~30 s.
 - `AUTH_CACHE_MAX_ENTRIES` (default `4096`); `USAGE_*` batch reporting knobs.
+- `API_KEY_RATE_LIMIT_ENFORCEMENT` (default `false`): kill switch for per-key
+  `assess` rate-limit enforcement. Absent or `false` preserves the old
+  behavior; explicit `true` enables it. Enforcement runs after authentication
+  and before upload parsing/inference, returns `429` with `Retry-After` based
+  on the remaining window, and rate-limited requests are recorded as `4xx`
+  usage. Counters are in-memory, keyed by the introspected `key_id` only, and
+  single-process: a restart resets them and N API workers multiply the
+  effective limit N-fold, so the loopback-only Redis backend
+  (`127.0.0.1:6379`) must be enabled before scaling to multi-worker or
+  multi-instance.
 
 Control-plane responses are backward compatible: unknown fields are tolerated,
 and malformed known fields fail closed (`503`). The contract also defines a
@@ -223,8 +233,9 @@ and malformed known fields fail closed (`503`). The contract also defines a
 window, category `assess` only. Absent is accepted (backward-compatible); an
 empty object, an unsupported category, or any spec that is not exactly
 `{"requests", "window_seconds"}` with integer values in bounds fails closed.
-The client parses this field defensively once the control plane starts
-emitting it.
+`requests=0` means deny-all (`429` always). This parsing runs during
+introspection regardless of the enforcement kill switch, so a malformed policy
+still fails closed with `503` while enforcement is disabled.
 
 ---
 

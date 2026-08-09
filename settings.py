@@ -198,6 +198,7 @@ class Settings:
     max_image_dimension: int
     max_concurrent_assessments: int
     demo_fallback_enabled: bool
+    api_key_rate_limit_enforcement: bool
 
 
 def load_settings(values: Mapping[str, str] | None = None) -> Settings:
@@ -245,4 +246,5 @@ def load_settings(values: Mapping[str, str] | None = None) -> Settings:
         max_image_dimension=_integer(source, "MAX_IMAGE_DIMENSION", DEFAULT_MAX_IMAGE_DIMENSION, 64),
         max_concurrent_assessments=_integer(source, "MAX_CONCURRENT_ASSESSMENTS", 4, 1),
         demo_fallback_enabled=demo_fallback_enabled,
+        api_key_rate_limit_enforcement=_boolean(source, "API_KEY_RATE_LIMIT_ENFORCEMENT", False),
     )

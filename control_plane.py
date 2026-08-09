@@ -136,6 +136,54 @@ def _parse_rate_limits(value):
     return parsed
 
 
+class FixedWindowRateLimiter:
+    """Bounded in-memory fixed-window counter keyed by managed key_id.
+
+    Single-process only: a restart resets every counter and N API workers
+    multiply the effective limit N-fold, so the shared Redis counter backend
+    (loopback 127.0.0.1:6379, never public) must be enabled before scaling to
+    multi-worker or multi-instance. Buckets are keyed by the introspection
+    key_id UUID, never raw key material; a rotated/new key_id starts a fresh
+    bucket. The clock is injectable (monotonic by default) so tests can advance
+    time without sleeping. Stale buckets from older windows are removed on
+    every check; at full capacity a new key fails closed (429).
+    """
+
+    def __init__(self, max_buckets: int = 10_000, clock=time.monotonic):
+        self._max_buckets = max_buckets
+        self._clock = clock
+        self._buckets: dict[str, tuple[int, int]] = {}
+        self._lock = asyncio.Lock()
+
+    async def check_and_increment(self, key_id: str, limit: int, window_seconds: int) -> int | None:
+        """Admit one request for key_id or deny with seconds until window reset.
+
+        Returns None to admit, otherwise the 429 Retry-After value. A
+        deny-all policy (requests=0) always denies and stores no bucket.
+        """
+        now = self._clock()
+        window = int(now // window_seconds)
+        retry = max(1, window_seconds - int(now % window_seconds))
+        if limit <= 0:
+            return retry
+        async with self._lock:
+            stale = [key for key, (bucket_window, _) in self._buckets.items() if bucket_window < window]
+            for key in stale:
+                self._buckets.pop(key, None)
+            if key_id not in self._buckets:
+                if len(self._buckets) >= self._max_buckets:
+                    return retry
+                self._buckets[key_id] = (window, 0)
+            bucket_window, count = self._buckets[key_id]
+            if bucket_window != window:
+                self._buckets[key_id] = (window, 0)
+                count = 0
+            if count >= limit:
+                return retry
+            self._buckets[key_id] = (window, count + 1)
+        return None
+
+
 class AuthGateway:
     def __init__(self, settings: Settings, transport=None, cache: IntrospectionCache | None = None):
         self.settings = settings

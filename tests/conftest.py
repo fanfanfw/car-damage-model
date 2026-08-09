@@ -73,11 +73,13 @@ class FakeAuthGateway:
         key_id=KEY_ID,
         scopes=(ASSESS_SCOPE,),
         raise_error=None,
+        rate_limits=None,
     ):
         self.active = active
         self.key_id = key_id
         self.scopes = scopes
         self.raise_error = raise_error
+        self.rate_limits = rate_limits
         self.attempts = []
 
     async def authenticate(self, api_key, scope):
@@ -92,7 +94,7 @@ class FakeAuthGateway:
         ):
             return AuthResult(active=False)
         if self.active and scope in self.scopes:
-            return AuthResult(active=True, key_id=self.key_id, scopes=self.scopes)
+            return AuthResult(active=True, key_id=self.key_id, scopes=self.scopes, rate_limits=self.rate_limits)
         return AuthResult(active=False)
 
 
@@ -123,7 +125,7 @@ class FakeUsageGateway:
 _DEFAULT = object()
 
 
-def make_app(settings=None, auth_gateway=_DEFAULT, usage_gateway=None):
+def make_app(settings=None, auth_gateway=_DEFAULT, usage_gateway=None, rate_limiter=None):
     from api import create_app
 
     if auth_gateway is _DEFAULT:
@@ -132,6 +134,7 @@ def make_app(settings=None, auth_gateway=_DEFAULT, usage_gateway=None):
         settings=settings or make_settings(),
         auth_gateway=auth_gateway,
         usage_gateway=usage_gateway or FakeUsageGateway(),
+        rate_limiter=rate_limiter,
     )
 
 

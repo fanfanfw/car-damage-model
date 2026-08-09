@@ -40,7 +40,7 @@ from fastapi.responses import JSONResponse  # noqa: E402
 from fastapi.security import APIKeyHeader  # noqa: E402
 from pydantic import BaseModel, Field  # noqa: E402
 
-from control_plane import AuthGateway, ControlPlaneUnavailable, UsageGateway  # noqa: E402
+from control_plane import AuthGateway, ControlPlaneUnavailable, FixedWindowRateLimiter, UsageGateway  # noqa: E402
 from settings import Settings, load_settings, parse_host  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -334,13 +334,16 @@ def validate_image(data: bytes, settings: Settings) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def _plain_json(send, status_code: int, body: dict) -> None:
+async def _plain_json(send, status_code: int, body: dict, extra_headers: list | None = None) -> None:
     payload = json.dumps(body, separators=(",", ":")).encode("utf-8")
+    headers = [(b"content-type", b"application/json")]
+    if extra_headers:
+        headers.extend(extra_headers)
     await send(
         {
             "type": "http.response.start",
             "status": status_code,
-            "headers": [(b"content-type", b"application/json")],
+            "headers": headers,
         }
     )
     await send({"type": "http.response.body", "body": payload})
@@ -413,6 +416,49 @@ class AssessAuthMiddleware:
         except (ValueError, AttributeError, TypeError):
             return await _plain_json(send, 503, {"detail": "Assessment service unavailable."})
         scope["api_key_id"] = result.key_id
+        scope["managed_rate_limits"] = result.rate_limits
+        return await self.app(scope, receive, send)
+
+
+class AssessRateLimitMiddleware:
+    """Enforces the control-plane per-key ``assess`` rate limit.
+
+    Runs after AssessAuthMiddleware (which sets ``scope["api_key_id"]`` and
+    ``scope["managed_rate_limits"]`` from AuthResult.rate_limits) and inside
+    UsageRecordingMiddleware so a 429 is recorded as 4xx usage. Only active
+    when ``API_KEY_RATE_LIMIT_ENFORCEMENT=true``; policy parsing happens during
+    introspection regardless of the kill switch, so a malformed policy still
+    fails closed with 503. Health, policy, docs, wrong methods, and non-assess
+    routes are never limited.
+    """
+
+    def __init__(self, app, state):
+        self.app = app
+        self.state = state
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        path = _app_path(scope)
+        if scope["method"] != "POST" or path != ASSESS_TEMPLATE:
+            return await self.app(scope, receive, send)
+        if not self.state.settings.api_key_rate_limit_enforcement:
+            return await self.app(scope, receive, send)
+        key_id = scope.get("api_key_id")
+        rate_limits = scope.get("managed_rate_limits")
+        spec = rate_limits.get("assess") if rate_limits else None
+        if not key_id or spec is None:
+            return await self.app(scope, receive, send)
+        retry_after = await self.state.rate_limiter.check_and_increment(
+            key_id, spec.requests, spec.window_seconds
+        )
+        if retry_after is not None:
+            return await _plain_json(
+                send,
+                429,
+                {"detail": "Rate limit exceeded"},
+                extra_headers=[(b"retry-after", str(retry_after).encode("ascii"))],
+            )
         return await self.app(scope, receive, send)
 
 
@@ -481,7 +527,8 @@ def _patch_openapi(application: FastAPI) -> None:
                 "control-plane dashboard for service `car-damage`; never commit "
                 "keys or put them in client-side JavaScript. 401 for missing, "
                 "invalid, inactive, or wrong-scope keys; 503 when the control "
-                "plane cannot be reached."
+                "plane cannot be reached; 429 when the per-key assess rate "
+                "limit is exceeded."
             )
         return schema
 
@@ -572,7 +619,7 @@ async def _run_decision(damages: list[dict], settings: Settings, assessment_id: 
     raise DecisionUnavailable
 
 
-def create_app(*, settings: Settings | None = None, auth_gateway=None, usage_gateway=None) -> FastAPI:
+def create_app(*, settings: Settings | None = None, auth_gateway=None, usage_gateway=None, rate_limiter=None) -> FastAPI:
     settings = settings if settings is not None else load_settings()
 
     application = FastAPI(
@@ -582,7 +629,8 @@ def create_app(*, settings: Settings | None = None, auth_gateway=None, usage_gat
             "POST /assess requires a managed `x-api-key` (scope car-damage:assess). "
             "Uploads are limited to JPEG/PNG/WebP within documented size and pixel "
             "bounds. Error semantics: 401 invalid/inactive key, 413 oversized "
-            "upload, 503 assessment or control plane unavailable."
+            "upload, 429 rate limit exceeded, 503 assessment or control plane "
+            "unavailable."
         ),
         version="0.2.0",
         docs_url="/docs" if settings.api_docs_enabled else None,
@@ -598,9 +646,11 @@ def create_app(*, settings: Settings | None = None, auth_gateway=None, usage_gat
     state.settings = settings
     state.auth_gateway = auth_gateway
     state.usage_gateway = usage_gateway
+    state.rate_limiter = rate_limiter or FixedWindowRateLimiter()
     state.assess_semaphore = asyncio.Semaphore(settings.max_concurrent_assessments)
     application.state._cd = state
 
+    application.add_middleware(AssessRateLimitMiddleware, state=state)
     application.add_middleware(UsageRecordingMiddleware, state=state)
     application.add_middleware(AssessAuthMiddleware, state=state)
     application.add_middleware(TrustedHostMiddleware, state=state)
@@ -665,6 +715,7 @@ def _register_routes(application: FastAPI) -> None:
         responses={
             401: {"description": "Missing, invalid, inactive, or wrong-scope API key."},
             413: {"description": "Upload exceeds the configured byte limit."},
+            429: {"description": "Per-key rate limit exceeded for the assess category."},
             503: {"description": "Assessment or control plane unavailable."},
         },
     )
