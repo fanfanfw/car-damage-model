@@ -12,13 +12,12 @@ import plotly.graph_objects as go
 import pandas as pd
 from datetime import datetime
 import textwrap
+from types import SimpleNamespace
 from streamlit.components.v1 import html as st_html
 
-# ✅ NEW: decision trace
+from assessment_api_client import AssessmentAPIError, assess_image
 from agentic.trace import build_decision_trace
 
-# ✅ Agentic imports
-from agentic.decision_agent import DecisionAgent
 from agentic.adapters import pick_primary_detection, detection_to_damage_signal
 from agentic.explainer import (
     build_customer_explanation,
@@ -32,13 +31,7 @@ from agentic.strategies import build_repair_strategies, build_damage_story
 # ✅ NEW: AI inpaint preview
 from agentic.vision.after_inpaint import make_repaired_after_preview
 
-# Import custom modules (optional; demo mode if missing)
-try:
-    from car_damage_detector import CarDamageDetector
-    from utils import enhance_image, calculate_damage_stats
-except ImportError:
-    st.warning("Custom modules not found. Running in demo mode.")
-    CarDamageDetector = None
+from utils import enhance_image, calculate_damage_stats
 
 
 # Page configuration
@@ -833,48 +826,38 @@ def main():
 
             if st.button("Analyze Damage", type="primary", use_container_width=True):
                 with st.spinner("Processing image and detecting damage..."):
-
-                    # Use real YOLOv8 model if available, otherwise fallback to demo
-                    if CarDamageDetector is not None:
-                        try:
-                            detector = CarDamageDetector(confidence_threshold=confidence_threshold)
-                            result = detector.detect_damage(image)
-                            det_list = result.get("damages", result.get("detections", []))
-                            annotated = detector.annotate_image(image, det_list)
-                            # Convert det_list to format app.py expects
-                            detections = []
-                            for d in det_list:
-                                detections.append({
-                                    "type": d.get("type", "unknown"),
-                                    "confidence": d.get("confidence", 0.5),
-                                    "severity": d.get("severity", "light"),
-                                    "bbox": d.get("bbox", [0,0,0,0]),
-                                    "area_percentage": d.get("area_percentage", 0),
-                                    "repair_cost": d.get("repair_cost", 0),
-                                    "location": d.get("location", "unknown"),
-                                })
-                            processed_image = annotated
-                        except Exception as e:
-                            st.warning(f"Model error: {e}. Using demo mode.")
-                            processed_image, detections = demo_damage_detection(image)
+                    try:
+                        result = assess_image(
+                            uploaded_file.name,
+                            uploaded_file.type or "application/octet-stream",
+                            uploaded_file.getvalue(),
+                        )
+                    except AssessmentAPIError as error:
+                        st.error(str(error))
                     else:
-                        processed_image, detections = demo_damage_detection(image)
+                        detections = [
+                            {
+                                "type": d.get("damage_type", "unknown"),
+                                "confidence": d.get("confidence", 0.5),
+                                "severity": d.get("severity", "light"),
+                                "bbox": d.get("bbox", [0, 0, 0, 0]),
+                                "area_percentage": d.get("area_percentage", 0),
+                                "estimated_cost": d.get("estimated_cost", 0),
+                                "location": d.get("location", "unknown"),
+                            }
+                            for d in result.get("damages_detected", [])
+                        ]
+                        processed_image = np.array(image).copy()
+                        for detection in detections:
+                            x1, y1, x2, y2 = detection["bbox"]
+                            cv2.rectangle(processed_image, (x1, y1), (x2, y2), (212, 168, 83), 3)
 
-                    # Normalize severity to Title case for display consistency
-                    for det in detections:
-                        if det.get("severity"):
-                            det["severity"] = det["severity"].capitalize()
-                        if det.get("type"):
-                            det["type"] = det["type"].replace("_", " ").title()
-
-                    st.session_state.processed_image = processed_image
-                    st.session_state.detections = detections
-
-                    # ✅ IMPORTANT: store ORIGINAL RGB image as numpy array
-                    st.session_state.original_image = np.array(image)  # RGB
-                    st.session_state.image_info = image.size
-
-                st.success(f"Analysis complete. Found {len(detections)} damage areas.")
+                        st.session_state.processed_image = processed_image
+                        st.session_state.detections = detections
+                        st.session_state.assessment = result
+                        st.session_state.original_image = np.array(image)
+                        st.session_state.image_info = image.size
+                        st.success(f"Analysis complete. Found {len(detections)} damage areas.")
 
     with col2:
         st.markdown("## Analysis Results")
@@ -891,18 +874,23 @@ def main():
             )
 
             detections = st.session_state.detections
-
-            # --- Agentic decision spike ---
-            agent = DecisionAgent(policies_dir="policies")
+            assessment = st.session_state.assessment
             primary = pick_primary_detection(detections)
 
             st.markdown("### Agent Decision")
 
             if primary is not None:
                 signal = detection_to_damage_signal(primary)
-                decision = agent.decide(signal)
+                api_trace = assessment.get("decision_trace", [])
+                first_trace = api_trace[0] if api_trace else {}
+                decision = SimpleNamespace(
+                    action=assessment["decision"],
+                    reason=first_trace.get("rule_applied", "Decision returned by assessment API."),
+                    policy_refs=[first_trace["threshold"]] if first_trace.get("threshold") else [],
+                    next_steps=[],
+                    evidence=first_trace.get("evidence"),
+                )
 
-                # ✅ 2.2 Decision trace
                 trace = build_decision_trace(primary_detection=primary, signal=signal, decision=decision)
                 with st.expander("🧾 Decision Trace (chain of evidence)", expanded=True):
                     for i, step in enumerate(trace["steps"], 1):
