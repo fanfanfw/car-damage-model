@@ -499,7 +499,7 @@ class UsageRecordingMiddleware:
 # App factory
 # ---------------------------------------------------------------------------
 
-API_KEY_HEADER = APIKeyHeader(name="x-api-key", auto_error=False, description="Managed API key issued by the control-plane dashboard.")
+API_KEY_HEADER = APIKeyHeader(name="x-api-key", auto_error=False)
 
 
 def require_managed_key(request: Request, _: str | None = Security(API_KEY_HEADER)) -> str:
@@ -512,27 +512,6 @@ def require_managed_key(request: Request, _: str | None = Security(API_KEY_HEADE
 
 def _demo_enabled(settings: Settings) -> bool:
     return settings.environment != "production" and settings.demo_fallback_enabled
-
-
-def _patch_openapi(application: FastAPI) -> None:
-    original = application.openapi
-
-    def patched_openapi() -> dict:
-        schema = original()
-        schemes = schema.setdefault("components", {}).setdefault("securitySchemes", {})
-        header = schemes.get("APIKeyHeader")
-        if header is not None:
-            header["description"] = (
-                "Managed API key sent in the 'x-api-key' header. Issued by the "
-                "control-plane dashboard for service `car-damage`; never commit "
-                "keys or put them in client-side JavaScript. 401 for missing, "
-                "invalid, inactive, or wrong-scope keys; 503 when the control "
-                "plane cannot be reached; 429 when the per-key assess rate "
-                "limit is exceeded."
-            )
-        return schema
-
-    application.openapi = patched_openapi
 
 
 @asynccontextmanager
@@ -624,14 +603,6 @@ def create_app(*, settings: Settings | None = None, auth_gateway=None, usage_gat
 
     application = FastAPI(
         title="Damage.ai — Vehicle Damage Assessment API",
-        description=(
-            "AI-powered vehicle damage assessment system. "
-            "POST /assess requires a managed `x-api-key` (scope car-damage:assess). "
-            "Uploads are limited to JPEG/PNG/WebP within documented size and pixel "
-            "bounds. Error semantics: 401 invalid/inactive key, 413 oversized "
-            "upload, 429 rate limit exceeded, 503 assessment or control plane "
-            "unavailable."
-        ),
         version="0.2.0",
         docs_url="/docs" if settings.api_docs_enabled else None,
         redoc_url="/redoc" if settings.api_docs_enabled else None,
@@ -664,7 +635,6 @@ def create_app(*, settings: Settings | None = None, auth_gateway=None, usage_gat
         )
 
     _register_routes(application)
-    _patch_openapi(application)
     return application
 
 
