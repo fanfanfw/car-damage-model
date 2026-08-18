@@ -409,8 +409,13 @@ class AssessAuthMiddleware:
             result = await gateway.authenticate(api_key, ASSESS_SCOPE)
         except ControlPlaneUnavailable:
             return await _plain_json(send, 503, {"detail": "Assessment service unavailable."})
-        if not result.active or not result.key_id or ASSESS_SCOPE not in result.scopes:
+        if not result.active or not result.key_id:
             return await _plain_json(send, 401, {"detail": "Invalid API key."})
+        if ASSESS_SCOPE not in result.scopes:
+            # Defensive: currently unreachable because the control plane
+            # returns active:false for all auth failures including missing
+            # scope (oracle safety).  Kept for a future richer response.
+            return await _plain_json(send, 403, {"detail": "Forbidden."})
         try:
             uuid.UUID(result.key_id)
         except (ValueError, AttributeError, TypeError):
@@ -499,7 +504,11 @@ class UsageRecordingMiddleware:
 # App factory
 # ---------------------------------------------------------------------------
 
-API_KEY_HEADER = APIKeyHeader(name="x-api-key", auto_error=False)
+API_KEY_HEADER = APIKeyHeader(
+    name="X-API-Key",
+    auto_error=False,
+    description="Managed client API key validated against the control plane.",
+)
 
 
 def require_managed_key(request: Request, _: str | None = Security(API_KEY_HEADER)) -> str:
@@ -682,12 +691,23 @@ def _register_routes(application: FastAPI) -> None:
         "/assess",
         response_model=AssessmentResult,
         tags=["Assessment"],
-        responses={
-            401: {"description": "Missing, invalid, inactive, or wrong-scope API key."},
-            413: {"description": "Upload exceeds the configured byte limit."},
-            429: {"description": "Per-key rate limit exceeded for the assess category."},
-            503: {"description": "Assessment or control plane unavailable."},
+        operation_id="assess_damage",
+        openapi_extra={
+            "x-api-scopes": ["car-damage:assess"],
+            "x-rate-limit-category": "assess",
+            "x-usage-enabled": True,
         },
+    responses={
+        401: {
+            "description": (
+                "Missing X-API-Key header, invalid key, inactive key, or "
+                "valid key missing the required scope."
+            ),
+        },
+        413: {"description": "Upload exceeds the configured byte limit."},
+        429: {"description": "Per-key rate limit exceeded for the assess category."},
+        503: {"description": "Assessment or control plane unavailable."},
+    },
     )
     async def assess_damage(
         request: Request,
@@ -696,7 +716,7 @@ def _register_routes(application: FastAPI) -> None:
     ):
         """Upload a vehicle image → structured damage assessment.
 
-        Requires a managed `x-api-key` with scope `car-damage:assess`.
+        Requires a managed `X-API-Key`.
         """
         state = application.state._cd
         settings: Settings = state.settings

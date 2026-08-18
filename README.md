@@ -426,6 +426,31 @@ Car-Damage-Assessment-AI/
 └── README.md
 ```
 
+## Production enablement
+
+**Required environment variables:**
+`CONTROL_PLANE_BASE_URL`, `SERVICE_CREDENTIAL`, `SERVICE_ID` (default `car-damage`),
+`AUTH_CACHE_MAX_TTL_SECONDS` (default 30).
+
+**Steps:**
+1. Seed the control-plane service configuration and backfill route
+   `rate_limit_category` / `usage_enabled` by running:
+   `python manage.py seed_car_damage --base-url <CAR_DAMAGE_URL>`
+   from the control-plane repository.
+2. Deploy with `API_KEY_RATE_LIMIT_ENFORCEMENT=false` (default).
+   Auth and usage reporting are active; per-key enforcement is off.
+3. Configure per-key rate-limit policies in the control plane.
+4. Set `API_KEY_RATE_LIMIT_ENFORCEMENT=true` to activate enforcement.
+
+**Topology constraint:** The per-key rate limiter uses in-memory
+counters.  Uvicorn must run with exactly `--workers 1`.  Increasing
+workers or adding replicas requires a shared counter backend (e.g.
+Redis) before deployment.
+
+**Authentication failure responses:** All authentication failures
+(invalid key, inactive key, missing scope) return HTTP 401.
+403 is reserved for a future richer control-plane response contract.
+
 ## 🧪 What this is (and is not)
 
 **This is:**

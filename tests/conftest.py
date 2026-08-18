@@ -93,7 +93,7 @@ class FakeAuthGateway:
             or not 8 <= len(api_key) <= 512
         ):
             return AuthResult(active=False)
-        if self.active and scope in self.scopes:
+        if self.active:
             return AuthResult(active=True, key_id=self.key_id, scopes=self.scopes, rate_limits=self.rate_limits)
         return AuthResult(active=False)
 

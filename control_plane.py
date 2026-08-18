@@ -254,27 +254,50 @@ class AuthGateway:
             data = response.json()
         except ValueError:
             raise ControlPlaneUnavailable from None
-        if not isinstance(data, dict):
-            raise ControlPlaneUnavailable
-        active = data.get("active")
-        if not isinstance(active, bool):
-            raise ControlPlaneUnavailable
-        if not active:
-            return AuthResult(active=False)
-        key_id = data.get("key_id")
-        scopes = data.get("scopes")
-        if not isinstance(key_id, str) or not isinstance(scopes, (list, tuple)) or not all(
-            isinstance(scope, str) for scope in scopes
-        ):
+        if not isinstance(data, dict) or not isinstance(data.get("active"), bool):
             raise ControlPlaneUnavailable
         cache_ttl = data.get("cache_ttl_seconds")
-        if cache_ttl is not None and (not isinstance(cache_ttl, int) or isinstance(cache_ttl, bool) or cache_ttl < 0):
+        if (
+            cache_ttl is not None
+            and (
+                not isinstance(cache_ttl, int)
+                or isinstance(cache_ttl, bool)
+                or cache_ttl < 0
+            )
+        ):
             raise ControlPlaneUnavailable
+        if not data["active"]:
+            return AuthResult(active=False, cache_ttl=cache_ttl)
+        key_id = data.get("key_id")
+        scopes = data.get("scopes")
+        expires_at = data.get("expires_at")
+        try:
+            uuid.UUID(key_id)
+        except (ValueError, AttributeError, TypeError):
+            raise ControlPlaneUnavailable from None
+        if (
+            not isinstance(scopes, list)
+            or len(scopes) > 100
+            or not all(
+                isinstance(scope, str) and 1 <= len(scope) <= 128
+                for scope in scopes
+            )
+        ):
+            raise ControlPlaneUnavailable
+        if expires_at is not None:
+            if not isinstance(expires_at, str):
+                raise ControlPlaneUnavailable
+            try:
+                parsed_expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+            except ValueError:
+                raise ControlPlaneUnavailable from None
+            if parsed_expiry.tzinfo is None:
+                raise ControlPlaneUnavailable
         return AuthResult(
             active=True,
             key_id=key_id,
             scopes=tuple(scopes),
-            expires_at=data.get("expires_at"),
+            expires_at=expires_at,
             cache_ttl=cache_ttl,
             rate_limits=_parse_rate_limits(data.get("rate_limits")),
         )

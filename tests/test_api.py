@@ -126,9 +126,10 @@ class TestDocs:
         assert response.status_code == 200
         schema = response.json()
         assert "APIKeyHeader" in schema["components"]["securitySchemes"]
-        assert schema["components"]["securitySchemes"]["APIKeyHeader"]["name"] == "x-api-key"
+        assert schema["components"]["securitySchemes"]["APIKeyHeader"]["name"] == "X-API-Key"
         assert schema["components"]["securitySchemes"]["APIKeyHeader"]["type"] == "apiKey"
-        assert "x-api-key" in schema["components"]["securitySchemes"]["APIKeyHeader"]["description"]
+        assert schema["components"]["securitySchemes"]["APIKeyHeader"]["in"] == "header"
+        assert "managed" in schema["components"]["securitySchemes"]["APIKeyHeader"]["description"].lower()
 
     def test_only_assess_requires_security(self):
         client = TestClient(make_app())
@@ -137,17 +138,30 @@ class TestDocs:
         assert "security" not in schema["paths"]["/health/live"]["get"]
         assert "security" not in schema["paths"]["/health/ready"]["get"]
 
-    def test_docs_pages_available_without_auth(self):
+    def test_assess_has_stable_operation_id_and_extensions(self):
         client = TestClient(make_app())
-        assert client.get("/docs").status_code == 200
-        assert client.get("/redoc").status_code == 200
-        assert client.get("/openapi.json").status_code == 200
+        schema = client.get("/openapi.json").json()
+        assess_op = schema["paths"]["/assess"]["post"]
+        assert assess_op["operationId"] == "assess_damage"
+        assert assess_op.get("x-api-scopes") == ["car-damage:assess"]
+        assert assess_op.get("x-rate-limit-category") == "assess"
+        assert assess_op.get("x-usage-enabled") is True
 
     def test_docs_have_no_real_key_or_credential(self):
         client = TestClient(make_app())
         body = client.get("/openapi.json").text
         assert VALID_KEY not in body
         assert "s" * 40 not in body
+
+    def test_operation_ids_are_unique(self):
+        client = TestClient(make_app())
+        schema = client.get("/openapi.json").json()
+        ids = []
+        for path_op in schema["paths"].values():
+            for method_op in path_op.values():
+                if isinstance(method_op, dict) and "operationId" in method_op:
+                    ids.append(method_op["operationId"])
+        assert len(ids) == len(set(ids))
 
 
 class TestPolicy:

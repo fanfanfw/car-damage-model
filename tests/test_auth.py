@@ -45,11 +45,18 @@ class TestMissingAndMalformed:
 
 
 class TestKeyState:
-    def test_wrong_scope_returns_401(self):
+    def test_wrong_scope_returns_403(self):
+        """403 branch exists for a future richer control-plane response.
+
+        Today the control plane returns active:false for missing scope (oracle
+        safety), so production sees 401 for all auth failures.  This test
+        exercises the defensive middleware path via FakeAuthGateway.
+        """
         gateway = FakeAuthGateway(scopes=("other:scope",))
         client = TestClient(make_app(auth_gateway=gateway))
         response = _post(client)
-        assert response.status_code == 401
+        assert response.status_code == 403
+        assert response.json() == {"detail": "Forbidden."}
 
     def test_inactive_key_returns_401(self):
         gateway = FakeAuthGateway(active=False)
