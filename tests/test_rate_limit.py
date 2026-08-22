@@ -64,8 +64,8 @@ class _PerKeyGateway:
         self.rate_limits = rate_limits
         self.attempts = []
 
-    async def authenticate(self, api_key, scope):
-        self.attempts.append(api_key)
+    async def authenticate(self, api_key, method, endpoint_template):
+        self.attempts.append((api_key, method, endpoint_template))
         key_id = self.mapping.get(api_key)
         if not key_id:
             return AuthResult(active=False)
@@ -168,9 +168,7 @@ class TestLimiterUnit:
         limiter = FixedWindowRateLimiter(clock=FakeClock(5.0))
 
         async def run():
-            results = await asyncio.gather(
-                *[limiter.check_and_increment("k", 2, 60) for _ in range(8)]
-            )
+            results = await asyncio.gather(*[limiter.check_and_increment("k", 2, 60) for _ in range(8)])
             assert results.count(None) == 2
 
         asyncio.run(run())
@@ -229,7 +227,7 @@ class TestPolicyValidationWhileDisabled:
                     "active": True,
                     "key_id": KEY_ID,
                     "scopes": [ASSESS_SCOPE],
-                    "rate_limits": {"assess": {"requests": 10}},
+                    "rate_limit": {"requests": 10},
                 },
             )
 
@@ -336,7 +334,7 @@ class TestHTTPEnforcement:
         assert _post(client).status_code == 200
         assert _post(client).status_code == 429
 
-    def test_absent_policy_preserves_old_behavior(self):
+    def test_absent_policy_fails_closed_when_enforcement_on(self):
         client = TestClient(
             make_app(
                 settings=make_settings(API_KEY_RATE_LIMIT_ENFORCEMENT="true"),
@@ -344,8 +342,44 @@ class TestHTTPEnforcement:
                 rate_limiter=FixedWindowRateLimiter(clock=FakeClock(0.0)),
             )
         )
+        assert _post(client).status_code == 503
+        assert _post(client).status_code == 503
+
+    def test_absent_policy_migration_mode_when_enforcement_off(self):
+        client = TestClient(
+            make_app(
+                settings=make_settings(API_KEY_RATE_LIMIT_ENFORCEMENT="false"),
+                auth_gateway=FakeAuthGateway(),
+                rate_limiter=FixedWindowRateLimiter(clock=FakeClock(0.0)),
+            )
+        )
         assert _post(client).status_code == 200
         assert _post(client).status_code == 200
+
+    def test_unrelated_category_does_not_satisfy_assess(self):
+        gateway = FakeAuthGateway(rate_limits={"predict": RateLimit(requests=1, window_seconds=60)})
+        client = TestClient(
+            make_app(
+                settings=make_settings(API_KEY_RATE_LIMIT_ENFORCEMENT="true"),
+                auth_gateway=gateway,
+                rate_limiter=FixedWindowRateLimiter(clock=FakeClock(0.0)),
+            )
+        )
+        assert _post(client).status_code == 503
+
+    def test_root_path_usage_records_canonical_template(self):
+        usage = FakeUsageGateway()
+        client = TestClient(
+            make_app(
+                settings=make_settings(API_KEY_RATE_LIMIT_ENFORCEMENT="true"),
+                auth_gateway=FakeAuthGateway(rate_limits=policy(1)),
+                rate_limiter=FixedWindowRateLimiter(clock=FakeClock(0.0)),
+                usage_gateway=usage,
+            ),
+            root_path="/api",
+        )
+        assert _post(client, path="/api/assess").status_code == 200
+        assert usage.records[-1]["endpoint_template"] == "/assess"
 
     def test_invalid_key_still_401(self):
         client = TestClient(

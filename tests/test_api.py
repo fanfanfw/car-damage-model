@@ -6,6 +6,7 @@ Run with: pytest tests/test_api.py -v
 Covers Fase 9 items: 1, 2, 9, 17, 18, 21, 22.
 """
 
+import asyncio
 import io
 
 from fastapi.testclient import TestClient
@@ -174,6 +175,60 @@ class TestPolicy:
         assert "rules_summary" in data
 
 
+class TestRootPathStripMiddleware:
+    def test_strips_root_path_prefix_from_scope(self):
+        from api import RootPathStripMiddleware
+
+        seen_paths = []
+
+        async def inner_app(scope, receive, send):
+            seen_paths.append(scope["path"])
+
+        app = RootPathStripMiddleware(inner_app)
+        scope = {"type": "http", "method": "GET", "path": "/api/assess", "root_path": "/api", "headers": []}
+        asyncio.get_event_loop().run_until_complete(app(scope, None, None))
+        assert seen_paths == ["/assess"]
+
+    def test_no_root_path_leaves_scope_unchanged(self):
+        from api import RootPathStripMiddleware
+
+        seen_paths = []
+
+        async def inner_app(scope, receive, send):
+            seen_paths.append(scope["path"])
+
+        app = RootPathStripMiddleware(inner_app)
+        scope = {"type": "http", "method": "GET", "path": "/assess", "root_path": "", "headers": []}
+        asyncio.get_event_loop().run_until_complete(app(scope, None, None))
+        assert seen_paths == ["/assess"]
+
+    def test_path_not_prefixed_by_root_is_unchanged(self):
+        from api import RootPathStripMiddleware
+
+        seen_paths = []
+
+        async def inner_app(scope, receive, send):
+            seen_paths.append(scope["path"])
+
+        app = RootPathStripMiddleware(inner_app)
+        scope = {"type": "http", "method": "GET", "path": "/other", "root_path": "/api", "headers": []}
+        asyncio.get_event_loop().run_until_complete(app(scope, None, None))
+        assert seen_paths == ["/other"]
+
+    def test_non_http_scope_is_passed_through(self):
+        from api import RootPathStripMiddleware
+
+        seen_types = []
+
+        async def inner_app(scope, receive, send):
+            seen_types.append(scope.get("type"))
+
+        app = RootPathStripMiddleware(inner_app)
+        scope = {"type": "lifespan"}
+        asyncio.get_event_loop().run_until_complete(app(scope, None, None))
+        assert seen_types == ["lifespan"]
+
+
 class TestRootPath:
     def test_root_path_api_assess_contract(self):
         """With uvicorn --root-path /api, /api/assess routes to /assess."""
@@ -186,9 +241,7 @@ class TestRootPath:
         """The wire path /api/assess (server entry /api) maps to /assess."""
         client = TestClient(make_app(), root_path="/api")
         files = {"image": ("car.jpg", io.BytesIO(make_image("JPEG")), "image/jpeg")}
-        response = client.post(
-            "/api/assess", files=files, headers={"x-api-key": VALID_KEY}
-        )
+        response = client.post("/api/assess", files=files, headers={"x-api-key": VALID_KEY})
         assert response.status_code == 200
         assert response.json()["assessment_id"]
 

@@ -321,11 +321,7 @@ def validate_image(data: bytes, settings: Settings) -> None:
         raise
     except Exception:
         raise UploadInvalid("Image file is corrupt or unsupported.") from None
-    if (
-        width > settings.max_image_dimension
-        or height > settings.max_image_dimension
-        or width * height > settings.max_image_pixels
-    ):
+    if width > settings.max_image_dimension or height > settings.max_image_dimension or width * height > settings.max_image_pixels:
         raise UploadInvalid("Image exceeds the allowed pixel dimensions.")
 
 
@@ -353,7 +349,7 @@ def _app_path(scope) -> str:
     path = scope.get("path", "")
     root = scope.get("root_path") or ""
     if root and path.startswith(root):
-        path = path[len(root):]
+        path = path[len(root) :]
     return path or "/"
 
 
@@ -406,16 +402,11 @@ class AssessAuthMiddleware:
         if gateway is None:
             return await _plain_json(send, 503, {"detail": "Assessment service unavailable."})
         try:
-            result = await gateway.authenticate(api_key, ASSESS_SCOPE)
+            result = await gateway.authenticate(api_key, "POST", ASSESS_TEMPLATE)
         except ControlPlaneUnavailable:
             return await _plain_json(send, 503, {"detail": "Assessment service unavailable."})
         if not result.active or not result.key_id:
             return await _plain_json(send, 401, {"detail": "Invalid API key."})
-        if ASSESS_SCOPE not in result.scopes:
-            # Defensive: currently unreachable because the control plane
-            # returns active:false for all auth failures including missing
-            # scope (oracle safety).  Kept for a future richer response.
-            return await _plain_json(send, 403, {"detail": "Forbidden."})
         try:
             uuid.UUID(result.key_id)
         except (ValueError, AttributeError, TypeError):
@@ -433,8 +424,10 @@ class AssessRateLimitMiddleware:
     UsageRecordingMiddleware so a 429 is recorded as 4xx usage. Only active
     when ``API_KEY_RATE_LIMIT_ENFORCEMENT=true``; policy parsing happens during
     introspection regardless of the kill switch, so a malformed policy still
-    fails closed with 503. Health, policy, docs, wrong methods, and non-assess
-    routes are never limited.
+    fails closed with 503. With enforcement on, an absent or unrelated
+    ``assess`` policy also fails closed with 503; with enforcement off the
+    request is admitted (migration mode). Health, policy, docs, wrong methods,
+    and non-assess routes are never limited.
     """
 
     def __init__(self, app, state):
@@ -452,11 +445,15 @@ class AssessRateLimitMiddleware:
         key_id = scope.get("api_key_id")
         rate_limits = scope.get("managed_rate_limits")
         spec = rate_limits.get("assess") if rate_limits else None
-        if not key_id or spec is None:
+        if not key_id:
             return await self.app(scope, receive, send)
-        retry_after = await self.state.rate_limiter.check_and_increment(
-            key_id, spec.requests, spec.window_seconds
-        )
+        if spec is None:
+            logger.warning(
+                "rate_limit_event category=policy_missing enforcement=enabled key_id_present=%s",
+                bool(key_id),
+            )
+            return await _plain_json(send, 503, {"detail": "Assessment service unavailable."})
+        retry_after = await self.state.rate_limiter.check_and_increment(key_id, spec.requests, spec.window_seconds)
         if retry_after is not None:
             return await _plain_json(
                 send,
@@ -498,6 +495,30 @@ class UsageRecordingMiddleware:
             return
         latency_ms = int(round((time.monotonic() - started) * 1000))
         gateway.record(key_id, scope["method"], ASSESS_TEMPLATE, f"{status_code // 100}xx", latency_ms)
+
+
+class RootPathStripMiddleware:
+    """Strip the ASGI root_path prefix from scope['path'] so FastAPI's router
+    sees the application-relative path (e.g. /assess not /api/assess).
+
+    When uvicorn is started with ``--root-path /api``, the ASGI scope contains
+    root_path="/api" but scope["path"] still holds the full wire path (e.g.
+    /api/assess).  The internal middleware already uses _app_path() to compute
+    the stripped path, but FastAPI's router reads scope["path"] directly and
+    returns404 if it still contains the prefix.  This middleware mutates the
+    scope in-place before any downstream middleware or the router sees it.
+    """
+
+    def __init__(self, app, **_kwargs):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        root = scope.get("root_path") or ""
+        if root and scope.get("path", "").startswith(root):
+            scope["path"] = scope["path"][len(root) :] or "/"
+        return await self.app(scope, receive, send)
 
 
 # ---------------------------------------------------------------------------
@@ -642,6 +663,7 @@ def create_app(*, settings: Settings | None = None, auth_gateway=None, usage_gat
             allow_methods=["POST", "GET", "OPTIONS"],
             allow_headers=["x-api-key", "content-type"],
         )
+    application.add_middleware(RootPathStripMiddleware)
 
     _register_routes(application)
     return application
@@ -697,17 +719,14 @@ def _register_routes(application: FastAPI) -> None:
             "x-rate-limit-category": "assess",
             "x-usage-enabled": True,
         },
-    responses={
-        401: {
-            "description": (
-                "Missing X-API-Key header, invalid key, inactive key, or "
-                "valid key missing the required scope."
-            ),
+        responses={
+            401: {
+                "description": ("Missing X-API-Key header, invalid key, inactive key, or valid key missing the required scope."),
+            },
+            413: {"description": "Upload exceeds the configured byte limit."},
+            429: {"description": "Per-key rate limit exceeded for the assess category."},
+            503: {"description": "Assessment or control plane unavailable."},
         },
-        413: {"description": "Upload exceeds the configured byte limit."},
-        429: {"description": "Per-key rate limit exceeded for the assess category."},
-        503: {"description": "Assessment or control plane unavailable."},
-    },
     )
     async def assess_damage(
         request: Request,
@@ -749,12 +768,8 @@ def _register_routes(application: FastAPI) -> None:
                 validate_image(image_bytes, settings)
                 size_bucket = _size_bucket(len(image_bytes))
 
-                damages, cv_backend = await _run_detection(
-                    image_bytes, settings, assessment_id, request_id
-                )
-                decision_result, policy_version = await _run_decision(
-                    damages, settings, assessment_id, request_id
-                )
+                damages, cv_backend = await _run_detection(image_bytes, settings, assessment_id, request_id)
+                decision_result, policy_version = await _run_decision(damages, settings, assessment_id, request_id)
             finally:
                 state.assess_semaphore.release()
         except UploadTooLarge:
@@ -821,8 +836,7 @@ def _register_routes(application: FastAPI) -> None:
 
         processing_time = int((time.monotonic() - start_time) * 1000)
         logger.info(
-            "assess_event request_id=%s assessment_id=%s status_class=2xx "
-            "size_bucket=%s latency_ms=%d damages=%d cv_backend=%s",
+            "assess_event request_id=%s assessment_id=%s status_class=2xx size_bucket=%s latency_ms=%d damages=%d cv_backend=%s",
             request_id,
             assessment_id,
             size_bucket,

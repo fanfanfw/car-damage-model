@@ -67,12 +67,12 @@ class TestAuthGatewaySuccess:
         async def handler(request):
             assert request.headers["authorization"] == f"Bearer {SERVICE_CRED}"
             payload = json.loads(request.content)
-            assert payload["api_key"] == KEY
-            assert payload["required_scope"] == "car-damage:assess"
+            assert request.url.path == "/internal/v2/keys/introspect"
+            assert payload == {"api_key": KEY, "method": "POST", "endpoint_template": "/assess"}
             return ok_response()
 
         gateway = auth_gateway(handler)
-        result = run(gateway.authenticate(KEY, "car-damage:assess"))
+        result = run(gateway.authenticate(KEY, "POST", "/assess"))
         assert result.active
         assert result.key_id == "11111111-2222-3333-4444-555555555555"
         assert result.scopes == ("car-damage:assess",)
@@ -85,7 +85,7 @@ class TestAuthGatewaySuccess:
             return ok_response()
 
         gateway = auth_gateway(handler)
-        run(gateway.authenticate(KEY, "car-damage:assess"))
+        run(gateway.authenticate(KEY, "POST", "/assess"))
         assert all(KEY not in key for key in gateway.cache._data)
         assert all(SERVICE_CRED not in key for key in gateway.cache._data)
 
@@ -97,16 +97,30 @@ class TestAuthGatewaySuccess:
             return ok_response()
 
         gateway = auth_gateway(handler)
-        run(gateway.authenticate(KEY, "car-damage:assess"))
-        run(gateway.authenticate(KEY, "car-damage:assess"))
+        run(gateway.authenticate(KEY, "POST", "/assess"))
+        run(gateway.authenticate(KEY, "POST", "/assess"))
         assert calls["n"] == 1
 
-    def test_hmac_key_binds_service_scope_and_key(self):
-        k1 = IntrospectionCache.key(b"k", "car-damage", "car-damage:assess", KEY)
-        k2 = IntrospectionCache.key(b"k", "car-damage", "other:scope", KEY)
-        k3 = IntrospectionCache.key(b"k", "other-service", "car-damage:assess", KEY)
-        k4 = IntrospectionCache.key(b"k", "car-damage", "car-damage:assess", KEY + "x")
-        assert len({k1, k2, k3, k4}) == 4
+    def test_hmac_key_binds_service_route_and_key(self):
+        k1 = IntrospectionCache.key(b"k", "car-damage", "POST", "/assess", KEY)
+        k2 = IntrospectionCache.key(b"k", "car-damage", "GET", "/assess", KEY)
+        k3 = IntrospectionCache.key(b"k", "car-damage", "POST", "/other", KEY)
+        k4 = IntrospectionCache.key(b"k", "other-service", "POST", "/assess", KEY)
+        k5 = IntrospectionCache.key(b"k", "car-damage", "POST", "/assess", KEY + "x")
+        assert len({k1, k2, k3, k4, k5}) == 5
+
+    def test_cache_isolated_by_route(self):
+        calls = {"n": 0}
+
+        async def handler(request):
+            calls["n"] += 1
+            return ok_response()
+
+        gateway = auth_gateway(handler)
+        run(gateway.authenticate(KEY, "POST", "/assess"))
+        run(gateway.authenticate(KEY, "POST", "/other"))
+        run(gateway.authenticate(KEY, "GET", "/assess"))
+        assert calls["n"] == 3
 
     def test_effective_ttl_bounded_by_response_and_expiry(self):
         gateway = auth_gateway(lambda request: ok_response())
@@ -123,17 +137,17 @@ class TestAuthGatewaySuccess:
     def test_cache_eviction_bounds_entries(self):
         gateway = auth_gateway(lambda request: ok_response())
         for i in range(50):
-            run(gateway.authenticate(f"key-{i}-abcdefghijklmnop", "car-damage:assess"))
+            run(gateway.authenticate(f"key-{i}-abcdefghijklmnop", "POST", "/assess"))
         assert len(gateway.cache._data) <= 8
 
     def test_introspection_token_bucket_bounds_control_plane_calls(self):
         gateway = auth_gateway(
             lambda request: ok_response(), AUTH_MAX_INTROSPECTIONS_PER_MINUTE="2"
         )
-        run(gateway.authenticate(f"{KEY}a", "car-damage:assess"))
-        run(gateway.authenticate(f"{KEY}b", "car-damage:assess"))
+        run(gateway.authenticate(f"{KEY}a", "POST", "/assess"))
+        run(gateway.authenticate(f"{KEY}b", "POST", "/assess"))
         with pytest.raises(ControlPlaneUnavailable):
-            run(gateway.authenticate(f"{KEY}c", "car-damage:assess"))
+            run(gateway.authenticate(f"{KEY}c", "POST", "/assess"))
 
 
 class TestAuthGatewayFailures:
@@ -143,17 +157,17 @@ class TestAuthGatewayFailures:
     def test_control_plane_401_credential_rejected(self):
         gateway = auth_gateway(lambda request: httpx.Response(401))
         with pytest.raises(ControlPlaneUnavailable):
-            run(gateway.authenticate(KEY, "car-damage:assess"))
+            run(gateway.authenticate(KEY, "POST", "/assess"))
 
     def test_control_plane_429(self):
         gateway = auth_gateway(lambda request: httpx.Response(429))
         with pytest.raises(ControlPlaneUnavailable):
-            run(gateway.authenticate(KEY, "car-damage:assess"))
+            run(gateway.authenticate(KEY, "POST", "/assess"))
 
     def test_control_plane_5xx(self):
         gateway = auth_gateway(lambda request: httpx.Response(500))
         with pytest.raises(ControlPlaneUnavailable):
-            run(gateway.authenticate(KEY, "car-damage:assess"))
+            run(gateway.authenticate(KEY, "POST", "/assess"))
 
     def test_network_timeout(self):
         async def handler(request):
@@ -161,84 +175,78 @@ class TestAuthGatewayFailures:
 
         gateway = auth_gateway(handler)
         with pytest.raises(ControlPlaneUnavailable):
-            run(gateway.authenticate(KEY, "car-damage:assess"))
+            run(gateway.authenticate(KEY, "POST", "/assess"))
 
     def test_malformed_json(self):
         gateway = auth_gateway(lambda request: httpx.Response(200, text="not json"))
         with pytest.raises(ControlPlaneUnavailable):
-            run(gateway.authenticate(KEY, "car-damage:assess"))
+            run(gateway.authenticate(KEY, "POST", "/assess"))
 
     def test_malformed_shape(self):
         gateway = auth_gateway(lambda request: httpx.Response(200, json={"nope": True}))
         with pytest.raises(ControlPlaneUnavailable):
-            run(gateway.authenticate(KEY, "car-damage:assess"))
+            run(gateway.authenticate(KEY, "POST", "/assess"))
 
     def test_inactive_result_not_cached_and_reported_inactive(self):
         async def handler(request):
             return httpx.Response(200, json={"active": False, "cache_ttl_seconds": 0})
 
         gateway = auth_gateway(handler)
-        result = run(gateway.authenticate(KEY, "car-damage:assess"))
+        result = run(gateway.authenticate(KEY, "POST", "/assess"))
         assert not result.active
         assert len(gateway.cache._data) == 0
 
     def test_raw_key_validation(self):
         gateway = auth_gateway(self.handler)
         for bad in ("", "short", "ü" * 10, "x" * 600):
-            result = run(gateway.authenticate(bad, "car-damage:assess"))
+            result = run(gateway.authenticate(bad, "POST", "/assess"))
             assert not result.active
 
 
 class TestIntrospectionContract:
-    def test_valid_rate_limits_are_parsed(self):
-        gateway = auth_gateway(lambda request: ok_response(rate_limits={"assess": {"requests": 10, "window_seconds": 60}}))
-        result = run(gateway.authenticate(KEY, "car-damage:assess"))
+    def test_valid_rate_limit_is_parsed(self):
+        gateway = auth_gateway(lambda request: ok_response(rate_limit={"requests": 10, "window_seconds": 60}))
+        result = run(gateway.authenticate(KEY, "POST", "/assess"))
         assert result.active
         assert result.rate_limits["assess"].requests == 10
         assert result.rate_limits["assess"].window_seconds == 60
 
-    def test_absent_rate_limits_are_tolerated(self):
+    def test_absent_rate_limit_is_tolerated(self):
         gateway = auth_gateway(lambda request: ok_response())
-        result = run(gateway.authenticate(KEY, "car-damage:assess"))
+        result = run(gateway.authenticate(KEY, "POST", "/assess"))
         assert result.active
         assert result.rate_limits is None
 
     def test_unknown_response_fields_are_tolerated(self):
         gateway = auth_gateway(lambda request: ok_response(future_field={"anything": [1, 2, 3]}))
-        result = run(gateway.authenticate(KEY, "car-damage:assess"))
+        result = run(gateway.authenticate(KEY, "POST", "/assess"))
         assert result.active
         assert result.key_id == "11111111-2222-3333-4444-555555555555"
 
-    def test_malformed_rate_limits_fail_closed(self):
+    def test_malformed_rate_limit_fails_closed(self):
         bad_values = [
             "10",
             {},
-            {"assess": "10"},
-            {"": {"requests": 10, "window_seconds": 60}},
-            {"unknown": {"requests": 10, "window_seconds": 60}},
-            {
-                "assess": {"requests": 10, "window_seconds": 60},
-                "submit": {"requests": 30, "window_seconds": 60},
-            },
-            {"assess": {"requests": 10}},
-            {"assess": {"window_seconds": 60}},
-            {"assess": {"requests": 10, "window_seconds": 60, "burst": 5}},
-            {"assess": {"requests": "10", "window_seconds": 60}},
-            {"assess": {"requests": 10, "window_seconds": "60"}},
-            {"assess": {"requests": 10, "window_seconds": 5}},
-            {"assess": {"requests": -1, "window_seconds": 60}},
-            {"assess": {"requests": 10_001, "window_seconds": 60}},
-            {"assess": {"requests": True, "window_seconds": 60}},
+            {"requests": 10},
+            {"window_seconds": 60},
+            {"requests": 10, "window_seconds": 60, "burst": 5},
+            {"requests": "10", "window_seconds": 60},
+            {"requests": 10, "window_seconds": "60"},
+            {"requests": 10, "window_seconds": 5},
+            {"requests": -1, "window_seconds": 60},
+            {"requests": 10_001, "window_seconds": 60},
+            {"requests": True, "window_seconds": 60},
+            {"requests": 10, "window_seconds": True},
         ]
-        for rate_limits in bad_values:
-            gateway = auth_gateway(lambda request, value=rate_limits: ok_response(rate_limits=value))
+        for rate_limit in bad_values:
+            gateway = auth_gateway(lambda request, value=rate_limit: ok_response(rate_limit=value))
             with pytest.raises(ControlPlaneUnavailable):
-                run(gateway.authenticate(KEY, "car-damage:assess"))
+                run(gateway.authenticate(KEY, "POST", "/assess"))
 
     def test_malformed_cache_ttl_fails_closed(self):
         gateway = auth_gateway(lambda request: ok_response(cache_ttl_seconds="5"))
         with pytest.raises(ControlPlaneUnavailable):
-            run(gateway.authenticate(KEY, "car-damage:assess"))
+            run(gateway.authenticate(KEY, "POST", "/assess"))
 
 
 class TestUsageGateway:

@@ -87,8 +87,8 @@ class IntrospectionCache:
         self._data: dict[str, CacheEntry] = {}
 
     @staticmethod
-    def key(keying: bytes, service: str, scope: str, api_key: str) -> str:
-        mac = hmac.new(keying, f"{service}|{scope}|{api_key}".encode(), hashlib.sha256)
+    def key(keying: bytes, service: str, method: str, endpoint_template: str, api_key: str) -> str:
+        mac = hmac.new(keying, f"{service}|{method}|{endpoint_template}|{api_key}".encode(), hashlib.sha256)
         return mac.hexdigest()
 
     def get(self, hash_key: str) -> AuthResult | None:
@@ -115,25 +115,16 @@ class IntrospectionCache:
         self._data.clear()
 
 
-def _parse_rate_limits(value):
-    if value is None:
-        return None
-    if not isinstance(value, dict) or not value:
+def _parse_rate_limit(value):
+    if not isinstance(value, dict) or set(value) != {"requests", "window_seconds"}:
         raise ControlPlaneUnavailable
-    parsed = {}
-    for category, spec in value.items():
-        if not isinstance(category, str) or category not in SUPPORTED_RATE_LIMIT_CATEGORIES or not isinstance(spec, dict) or set(spec) != {"requests", "window_seconds"}:
-            raise ControlPlaneUnavailable
-        requests = spec.get("requests")
-        window = spec.get("window_seconds")
-        if not isinstance(requests, int) or isinstance(requests, bool) or not isinstance(window, int) or isinstance(window, bool):
-            raise ControlPlaneUnavailable
-        if not 0 <= requests <= RATE_LIMIT_MAX_REQUESTS:
-            raise ControlPlaneUnavailable
-        if window != RATE_LIMIT_WINDOW_SECONDS:
-            raise ControlPlaneUnavailable
-        parsed[category] = RateLimit(requests=requests, window_seconds=window)
-    return parsed
+    requests = value.get("requests")
+    window = value.get("window_seconds")
+    if type(requests) is not int or type(window) is not int:
+        raise ControlPlaneUnavailable
+    if not 0 <= requests <= RATE_LIMIT_MAX_REQUESTS or window != RATE_LIMIT_WINDOW_SECONDS:
+        raise ControlPlaneUnavailable
+    return {"assess": RateLimit(requests=requests, window_seconds=window)}
 
 
 class FixedWindowRateLimiter:
@@ -206,34 +197,34 @@ class AuthGateway:
         self._introspect_count += 1
         return True
 
-    async def authenticate(self, api_key: str, scope: str) -> AuthResult:
+    async def authenticate(self, api_key: str, method: str, endpoint_template: str) -> AuthResult:
         if not api_key or not api_key.isascii() or not 8 <= len(api_key) <= 512:
             return AuthResult(active=False)
         service = self.settings.service_id
-        hash_key = IntrospectionCache.key(self._keying, service, scope, api_key)
+        hash_key = IntrospectionCache.key(self._keying, service, method, endpoint_template, api_key)
         cached = self.cache.get(hash_key)
         if cached is not None:
             return cached
         if not self._allow_introspection():
             raise ControlPlaneUnavailable
-        result = await self._introspect(api_key, service, scope)
+        result = await self._introspect(api_key, service, method, endpoint_template)
         if result.active:
             self.cache.put(hash_key, result, self._effective_ttl(result))
         return result
 
-    async def _introspect(self, api_key: str, service: str, scope: str) -> AuthResult:
+    async def _introspect(self, api_key: str, service: str, method: str, endpoint_template: str) -> AuthResult:
         base = self.settings.control_plane_base_url
         if not base:
             raise ControlPlaneUnavailable
         headers = {"Authorization": f"Bearer {self.settings.service_credential}"}
-        payload = {"api_key": api_key, "required_scope": scope}
+        payload = {"api_key": api_key, "method": method, "endpoint_template": endpoint_template}
         try:
             async with httpx.AsyncClient(
                 timeout=httpx.Timeout(self.settings.introspection_timeout_seconds),
                 transport=self.transport,
             ) as client:
                 response = await client.post(
-                    f"{base}/internal/v1/keys/introspect",
+                    f"{base}/internal/v2/keys/introspect",
                     json=payload,
                     headers=headers,
                 )
@@ -299,7 +290,7 @@ class AuthGateway:
             scopes=tuple(scopes),
             expires_at=expires_at,
             cache_ttl=cache_ttl,
-            rate_limits=_parse_rate_limits(data.get("rate_limits")),
+            rate_limits=_parse_rate_limit(data.get("rate_limit")) if "rate_limit" in data else None,
         )
 
     def _effective_ttl(self, result: AuthResult) -> int:

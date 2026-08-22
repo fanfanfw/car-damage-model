@@ -82,8 +82,8 @@ class FakeAuthGateway:
         self.rate_limits = rate_limits
         self.attempts = []
 
-    async def authenticate(self, api_key, scope):
-        self.attempts.append(api_key)
+    async def authenticate(self, api_key, method, endpoint_template):
+        self.attempts.append((api_key, method, endpoint_template))
         if self.raise_error is not None:
             raise self.raise_error
         if (
