@@ -177,7 +177,6 @@ def _forwarded_allow_ips(values: Mapping[str, str], production: bool) -> str:
 @dataclass(frozen=True)
 class Settings:
     environment: str
-    service_id: str
     control_plane_base_url: str
     service_credential: str
     introspection_timeout_seconds: int
@@ -225,7 +224,6 @@ def load_settings(values: Mapping[str, str] | None = None) -> Settings:
 
     return Settings(
         environment=environment,
-        service_id=source.get("SERVICE_ID", "car-damage").strip() or "car-damage",
         control_plane_base_url=control_plane_base_url,
         service_credential=service_credential,
         introspection_timeout_seconds=_integer(source, "CONTROL_PLANE_INTROSPECT_TIMEOUT_SECONDS", 2, 1),

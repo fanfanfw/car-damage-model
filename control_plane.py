@@ -87,8 +87,8 @@ class IntrospectionCache:
         self._data: dict[str, CacheEntry] = {}
 
     @staticmethod
-    def key(keying: bytes, service: str, method: str, endpoint_template: str, api_key: str) -> str:
-        mac = hmac.new(keying, f"{service}|{method}|{endpoint_template}|{api_key}".encode(), hashlib.sha256)
+    def key(keying: bytes, method: str, endpoint_template: str, api_key: str) -> str:
+        mac = hmac.new(keying, f"{method}|{endpoint_template}|{api_key}".encode(), hashlib.sha256)
         return mac.hexdigest()
 
     def get(self, hash_key: str) -> AuthResult | None:
@@ -200,19 +200,18 @@ class AuthGateway:
     async def authenticate(self, api_key: str, method: str, endpoint_template: str) -> AuthResult:
         if not api_key or not api_key.isascii() or not 8 <= len(api_key) <= 512:
             return AuthResult(active=False)
-        service = self.settings.service_id
-        hash_key = IntrospectionCache.key(self._keying, service, method, endpoint_template, api_key)
+        hash_key = IntrospectionCache.key(self._keying, method, endpoint_template, api_key)
         cached = self.cache.get(hash_key)
         if cached is not None:
             return cached
         if not self._allow_introspection():
             raise ControlPlaneUnavailable
-        result = await self._introspect(api_key, service, method, endpoint_template)
+        result = await self._introspect(api_key, method, endpoint_template)
         if result.active:
             self.cache.put(hash_key, result, self._effective_ttl(result))
         return result
 
-    async def _introspect(self, api_key: str, service: str, method: str, endpoint_template: str) -> AuthResult:
+    async def _introspect(self, api_key: str, method: str, endpoint_template: str) -> AuthResult:
         base = self.settings.control_plane_base_url
         if not base:
             raise ControlPlaneUnavailable

@@ -101,12 +101,12 @@ class TestAuthGatewaySuccess:
         run(gateway.authenticate(KEY, "POST", "/assess"))
         assert calls["n"] == 1
 
-    def test_hmac_key_binds_service_route_and_key(self):
-        k1 = IntrospectionCache.key(b"k", "car-damage", "POST", "/assess", KEY)
-        k2 = IntrospectionCache.key(b"k", "car-damage", "GET", "/assess", KEY)
-        k3 = IntrospectionCache.key(b"k", "car-damage", "POST", "/other", KEY)
-        k4 = IntrospectionCache.key(b"k", "other-service", "POST", "/assess", KEY)
-        k5 = IntrospectionCache.key(b"k", "car-damage", "POST", "/assess", KEY + "x")
+    def test_hmac_key_binds_route_and_key(self):
+        k1 = IntrospectionCache.key(b"k", "POST", "/assess", KEY)
+        k2 = IntrospectionCache.key(b"k", "GET", "/assess", KEY)
+        k3 = IntrospectionCache.key(b"k", "POST", "/other", KEY)
+        k4 = IntrospectionCache.key(b"other", "POST", "/assess", KEY)
+        k5 = IntrospectionCache.key(b"k", "POST", "/assess", KEY + "x")
         assert len({k1, k2, k3, k4, k5}) == 5
 
     def test_cache_isolated_by_route(self):

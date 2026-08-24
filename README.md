@@ -206,7 +206,7 @@ curl http://localhost:8000/health | python -m json.tool
 API Key Management control plane (`apiKeyManagementFF`). Required env vars
 (see `.env.example`):
 
-- `SERVICE_ID=car-damage` and `SERVICE_CREDENTIAL` issued for that slug
+- `SERVICE_CREDENTIAL` issued for the Car Damage service
   (production required; 32-512 ASCII chars).
 - `CONTROL_PLANE_BASE_URL`: production plain-HTTP must be a Tailscale peer
   (`100.64.0.0/10`) or the loopback-only internal listener
@@ -429,7 +429,7 @@ Car-Damage-Assessment-AI/
 ## Production enablement
 
 **Required environment variables:**
-`CONTROL_PLANE_BASE_URL`, `SERVICE_CREDENTIAL`, `SERVICE_ID` (default `car-damage`),
+`CONTROL_PLANE_BASE_URL`, `SERVICE_CREDENTIAL`,
 `AUTH_CACHE_MAX_TTL_SECONDS` (default 30).
 
 **Steps:**
