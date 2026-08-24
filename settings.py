@@ -144,7 +144,7 @@ def _control_plane_url(value: str, production: bool) -> str:
             if parsed.hostname != "127.0.0.1" or parsed.port != 18083:
                 raise ValueError(
                     "CONTROL_PLANE_BASE_URL over loopback http in production must be "
-                    "exactly http://127.0.0.1:18083 (the /internal/v1/*-only listener); "
+                    "exactly http://127.0.0.1:18083 (the internal-only listener); "
                     "it must not point at gunicorn 18080 or any other localhost port"
                 )
             return value.rstrip("/")
