@@ -15,6 +15,7 @@ VALID_KEY = "managed-key-abcdefghijklmnop"  # synthetic, >= 8 ascii
 def make_settings(**overrides):
     base = {
         "ENVIRONMENT": "development",
+        "AUTH_MODE": "control-plane",
         "DEMO_FALLBACK_ENABLED": "true",
         "ALLOWED_HOSTS": "testserver,localhost,127.0.0.1",
         "CONTROL_PLANE_BASE_URL": "http://100.124.216.27:18080",

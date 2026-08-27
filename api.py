@@ -375,8 +375,6 @@ class TrustedHostMiddleware:
 
 
 class AssessAuthMiddleware:
-    """Authenticates the managed x-api-key for POST /assess only."""
-
     def __init__(self, app, state):
         self.app = app
         self.state = state
@@ -386,6 +384,20 @@ class AssessAuthMiddleware:
             return await self.app(scope, receive, send)
         path = _app_path(scope)
         if scope["method"] != "POST" or path != ASSESS_TEMPLATE:
+            return await self.app(scope, receive, send)
+        if self.state.settings.auth_mode == "kong":
+            values = [value for name, value in scope["headers"] if name.lower() == b"x-consumer-id"]
+            anonymous = [value for name, value in scope["headers"] if name.lower() == b"x-anonymous-consumer"]
+            if len(values) != 1 or anonymous:
+                return await _plain_json(send, 401, {"detail": "Invalid Kong consumer identity."})
+            try:
+                consumer_id = values[0].decode("ascii")
+                parsed_id = uuid.UUID(consumer_id)
+            except (UnicodeDecodeError, ValueError, AttributeError, TypeError):
+                return await _plain_json(send, 401, {"detail": "Invalid Kong consumer identity."})
+            if str(parsed_id) != consumer_id.lower():
+                return await _plain_json(send, 401, {"detail": "Invalid Kong consumer identity."})
+            scope["api_key_id"] = consumer_id.lower()
             return await self.app(scope, receive, send)
 
         values = [value for name, value in scope["headers"] if name.lower() == b"x-api-key"]
@@ -440,7 +452,7 @@ class AssessRateLimitMiddleware:
         path = _app_path(scope)
         if scope["method"] != "POST" or path != ASSESS_TEMPLATE:
             return await self.app(scope, receive, send)
-        if not self.state.settings.api_key_rate_limit_enforcement:
+        if self.state.settings.auth_mode == "kong" or not self.state.settings.api_key_rate_limit_enforcement:
             return await self.app(scope, receive, send)
         key_id = scope.get("api_key_id")
         rate_limits = scope.get("managed_rate_limits")
@@ -489,6 +501,8 @@ class UsageRecordingMiddleware:
         await self.app(scope, receive, wrapped_send)
         key_id = scope.get("api_key_id")
         if status_code is None or not key_id:
+            return
+        if self.state.settings.auth_mode == "kong":
             return
         gateway: UsageGateway | None = self.state.usage_gateway
         if gateway is None:
@@ -547,18 +561,20 @@ def _demo_enabled(settings: Settings) -> bool:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     state = app.state._cd
-    if state.auth_gateway is None:
-        state.auth_gateway = AuthGateway(state.settings)
-    if state.usage_gateway is None:
-        state.usage_gateway = UsageGateway(state.settings)
-    await state.usage_gateway.start()
-    logger.info("car-damage api started (environment=%s)", state.settings.environment)
+    if state.settings.auth_mode == "control-plane":
+        if state.auth_gateway is None:
+            state.auth_gateway = AuthGateway(state.settings)
+        if state.usage_gateway is None:
+            state.usage_gateway = UsageGateway(state.settings)
+        await state.usage_gateway.start()
+    logger.info("car-damage api started (environment=%s auth_mode=%s)", state.settings.environment, state.settings.auth_mode)
     try:
         yield
     finally:
-        await state.usage_gateway.stop()
-        state.auth_gateway = None
-        state.usage_gateway = None
+        if state.settings.auth_mode == "control-plane":
+            await state.usage_gateway.stop()
+            state.auth_gateway = None
+            state.usage_gateway = None
 
 
 async def _run_detection(image_bytes: bytes, settings: Settings, assessment_id: str, request_id: str) -> tuple[list[dict], str]:

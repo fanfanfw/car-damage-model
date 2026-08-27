@@ -9,13 +9,43 @@ from fastapi.testclient import TestClient
 
 from control_plane import ControlPlaneUnavailable
 
-from .conftest import VALID_KEY, FakeAuthGateway, make_app, make_image
+from .conftest import KEY_ID, VALID_KEY, FakeAuthGateway, FakeUsageGateway, make_app, make_image, make_settings
 
 
 def _post(client, key=VALID_KEY, keys=None, image=None):
     files = {"image": ("car.jpg", io.BytesIO(image or make_image("JPEG")), "image/jpeg")}
     headers = keys if keys is not None else ({"x-api-key": key} if key is not None else {})
     return client.post("/assess", files=files, headers=headers)
+
+
+class TestKongIdentity:
+    def test_valid_consumer_id_admits_without_control_plane_or_usage(self):
+        usage = FakeUsageGateway()
+        client = TestClient(make_app(settings=make_settings(AUTH_MODE="kong"), auth_gateway=None, usage_gateway=usage))
+        response = _post(client, keys={"x-api-key": VALID_KEY, "x-consumer-id": KEY_ID})
+        assert response.status_code == 200
+        assert usage.records == []
+        assert usage.started is False
+
+    def test_missing_consumer_id_fails_closed(self):
+        client = TestClient(make_app(settings=make_settings(AUTH_MODE="kong"), auth_gateway=None))
+        assert _post(client).status_code == 401
+
+    def test_duplicate_consumer_id_fails_closed(self):
+        client = TestClient(make_app(settings=make_settings(AUTH_MODE="kong"), auth_gateway=None))
+        response = _post(client, keys=[("x-consumer-id", KEY_ID), ("x-consumer-id", KEY_ID)])
+        assert response.status_code == 401
+
+    def test_malformed_or_anonymous_consumer_fails_closed(self):
+        client = TestClient(make_app(settings=make_settings(AUTH_MODE="kong"), auth_gateway=None))
+        assert _post(client, keys={"x-consumer-id": "not-a-uuid"}).status_code == 401
+        assert _post(client, keys={"x-consumer-id": KEY_ID, "x-anonymous-consumer": "true"}).status_code == 401
+
+    def test_docs_and_health_remain_public(self):
+        client = TestClient(make_app(settings=make_settings(AUTH_MODE="kong"), auth_gateway=None))
+        assert client.get("/health/live").status_code == 200
+        schema = client.get("/openapi.json").json()
+        assert schema["components"]["securitySchemes"]["APIKeyHeader"]["name"] == "X-API-Key"
 
 
 class TestMissingAndMalformed:

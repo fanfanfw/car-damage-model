@@ -136,8 +136,13 @@ class TestDocs:
         client = TestClient(make_app())
         schema = client.get("/openapi.json").json()
         assert schema["paths"]["/assess"]["post"]["security"] == [{"APIKeyHeader": []}]
-        assert "security" not in schema["paths"]["/health/live"]["get"]
-        assert "security" not in schema["paths"]["/health/ready"]["get"]
+        assert all(
+            "security" not in operation
+            for path, methods in schema["paths"].items()
+            if path != "/assess"
+            for operation in methods.values()
+            if isinstance(operation, dict) and "responses" in operation
+        )
 
     def test_assess_has_stable_operation_id_and_extensions(self):
         client = TestClient(make_app())

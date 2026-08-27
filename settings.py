@@ -177,6 +177,7 @@ def _forwarded_allow_ips(values: Mapping[str, str], production: bool) -> str:
 @dataclass(frozen=True)
 class Settings:
     environment: str
+    auth_mode: str
     control_plane_base_url: str
     service_credential: str
     introspection_timeout_seconds: int
@@ -206,17 +207,20 @@ def load_settings(values: Mapping[str, str] | None = None) -> Settings:
     if environment not in {"development", "production"}:
         raise ValueError("ENVIRONMENT must be development or production")
     production = environment == "production"
+    auth_mode = source.get("AUTH_MODE", "kong" if production else "control-plane").strip().lower()
+    if auth_mode not in {"kong", "control-plane"}:
+        raise ValueError("AUTH_MODE must be kong or control-plane")
 
     service_credential = source.get("SERVICE_CREDENTIAL", "").strip()
-    if production and not (
+    if production and auth_mode == "control-plane" and not (
         service_credential
         and service_credential.isascii()
         and 32 <= len(service_credential) <= 512
     ):
-        raise ValueError("SERVICE_CREDENTIAL is required in production")
+        raise ValueError("SERVICE_CREDENTIAL is required in production control-plane mode")
 
     control_plane_base_url = _control_plane_url(
-        source.get("CONTROL_PLANE_BASE_URL", ""), production
+        source.get("CONTROL_PLANE_BASE_URL", ""), production and auth_mode == "control-plane"
     )
     demo_fallback_enabled = _boolean(source, "DEMO_FALLBACK_ENABLED", False)
     if production and demo_fallback_enabled:
@@ -224,6 +228,7 @@ def load_settings(values: Mapping[str, str] | None = None) -> Settings:
 
     return Settings(
         environment=environment,
+        auth_mode=auth_mode,
         control_plane_base_url=control_plane_base_url,
         service_credential=service_credential,
         introspection_timeout_seconds=_integer(source, "CONTROL_PLANE_INTROSPECT_TIMEOUT_SECONDS", 2, 1),
