@@ -1,0 +1,64 @@
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_PIPELINE_SOURCE =~ /^(push|web|api)$/ && $CI_COMMIT_BRANCH == "main" && $CI_COMMIT_REF_PROTECTED == "true"'
+    - when: never
+
+stages: [test, build, deploy]
+
+variables:
+  GHCR_IMAGE: ghcr.io/fanfanfw/car-damage-api
+  GIT_SUBMODULE_STRATEGY: none
+
+api-checks:
+  stage: test
+  image: python:3.12-slim@sha256:191083cdf6c7bda8c76158983163ead5d5cf7b77cf3033e805bb0f5296f51b4b
+  tags: [car-damage-ci]
+  timeout: 15 minutes
+  interruptible: true
+  script:
+    - sha256sum -c models/best.pt.sha256
+    - python -m pip install --no-cache-dir -r requirements-api.txt pillow pyyaml requests pytest
+    - python -m pytest -q -p no:cacheprovider
+
+build-ghcr:
+  stage: build
+  image:
+    name: moby/buildkit:v0.35.1-rootless@sha256:7d02292556e66feea6d2d89b7ec143503b57e4f59a4efc6b7ece8547e4d3e5be
+    entrypoint: [""]
+  tags: [car-damage-build]
+  timeout: 30 minutes
+  resource_group: car-damage-ghcr-build
+  variables:
+    BUILDKITD_FLAGS: --oci-worker-no-process-sandbox
+  environment:
+    name: registry
+    action: prepare
+  rules:
+    - if: '$CI_PIPELINE_SOURCE =~ /^(push|web|api)$/ && $CI_COMMIT_BRANCH == "main" && $CI_COMMIT_REF_PROTECTED == "true"'
+  script:
+    - sh ci/build_ghcr.sh
+  artifacts:
+    paths: [build/image-metadata.json, build/release-commit.txt]
+    expire_in: 7 days
+
+deploy-production:
+  stage: deploy
+  image: python:3.12-slim@sha256:191083cdf6c7bda8c76158983163ead5d5cf7b77cf3033e805bb0f5296f51b4b
+  tags: [car-damage-ci]
+  needs:
+    - job: build-ghcr
+      artifacts: true
+  environment: production
+  resource_group: car-damage-production
+  timeout: 25 minutes
+  rules:
+    - if: '$CI_PIPELINE_SOURCE =~ /^(push|web|api)$/ && $CI_COMMIT_BRANCH == "main" && $CI_COMMIT_REF_PROTECTED == "true" && $CAR_DAMAGE_DEPLOY_ENABLED == "true"'
+      when: manual
+      allow_failure: false
+  script:
+    - python -B ci/deploy_dokploy.py
+  artifacts:
+    when: always
+    paths: [build/deploy-receipt.json]
+    expire_in: 30 days

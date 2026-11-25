@@ -21,7 +21,7 @@ class CarDamageDetector:
     of car damage including scratches, dents, paint damage, and broken parts.
     """
     
-    def __init__(self, model_path: Optional[str] = None, confidence_threshold: float = 0.5):
+    def __init__(self, model_path: Optional[str] = None, confidence_threshold: float = 0.5, *, require_checkpoint: bool = False):
         """
         Initialize the car damage detector.
         
@@ -30,7 +30,8 @@ class CarDamageDetector:
             confidence_threshold (float): Minimum confidence for detections
         """
         self.confidence_threshold = confidence_threshold
-        self.model_path = model_path or str(Path(__file__).parent / "models" / "best.pt")  # Default to nano model
+        self.model_path = model_path or str(Path(__file__).parent / "models" / "best.pt")
+        self.require_checkpoint = require_checkpoint
         self.device = self._get_device()
         self.model = None
         self.class_names = {
@@ -46,10 +47,6 @@ class CarDamageDetector:
             9: "tire_flat"
         }
         
-        # Damage severity mapping based on area and type
-        # Auto-load model on init
-        self._load_model()
-
         self.severity_mapping = {
             "scratch": {"light": (0, 5), "moderate": (5, 15), "severe": (15, 100)},
             "dent": {"light": (0, 3), "moderate": (3, 10), "severe": (10, 100)},
@@ -83,7 +80,7 @@ class CarDamageDetector:
             if os.path.exists(self.model_path):
                 logger.info(f"Loading custom model from {self.model_path}")
                 self.model = YOLO(self.model_path)
-            else:
+            elif not self.require_checkpoint:
                 # Use pre-trained YOLOv8 model
                 logger.info("Loading pre-trained YOLOv8 model")
                 self.model = YOLO("yolov8n.pt")
@@ -91,6 +88,8 @@ class CarDamageDetector:
                 # In a real implementation, you would load a model specifically
                 # trained on car damage dataset. For demo, we use the base model.
                 logger.warning("Using base YOLOv8 model. For production, use a model trained on car damage data.")
+            else:
+                raise FileNotFoundError("Car Damage checkpoint is missing")
             
             # Move model to appropriate device
             if self.device != "cpu":
@@ -207,7 +206,7 @@ class CarDamageDetector:
             original_shape = img_array.shape[:2]  # (height, width)
             
             # Run inference
-            results = self.model(img_array, conf=self.confidence_threshold, verbose=False)
+            results = self.model(img_array, conf=self.confidence_threshold, device=self.device, verbose=False)
             
             # Process results
             detections = []

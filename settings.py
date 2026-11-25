@@ -199,6 +199,7 @@ class Settings:
     max_concurrent_assessments: int
     demo_fallback_enabled: bool
     api_key_rate_limit_enforcement: bool
+    require_cuda: bool
 
 
 def load_settings(values: Mapping[str, str] | None = None) -> Settings:
@@ -250,4 +251,5 @@ def load_settings(values: Mapping[str, str] | None = None) -> Settings:
         max_concurrent_assessments=_integer(source, "MAX_CONCURRENT_ASSESSMENTS", 4, 1),
         demo_fallback_enabled=demo_fallback_enabled,
         api_key_rate_limit_enforcement=_boolean(source, "API_KEY_RATE_LIMIT_ENFORCEMENT", False),
+        require_cuda=_boolean(source, "CAR_DAMAGE_REQUIRE_CUDA", False),
     )

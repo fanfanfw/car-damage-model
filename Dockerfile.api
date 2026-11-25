@@ -1,0 +1,38 @@
+FROM python:3.12-slim@sha256:191083cdf6c7bda8c76158983163ead5d5cf7b77cf3033e805bb0f5296f51b4b AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    HOME=/tmp YOLO_CONFIG_DIR=/tmp/ultralytics YOLO_AUTOINSTALL=false \
+    OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+COPY requirements-api-image.lock ./
+RUN python -m pip install --require-hashes -r requirements-api-image.lock && python -m pip check
+
+COPY api.py settings.py control_plane.py car_damage_detector.py ./
+COPY agentic/ ./agentic/
+COPY policies/ ./policies/
+COPY knowledge/ ./knowledge/
+COPY models/best.pt models/best.pt.sha256 ./models/
+RUN sha256sum -c models/best.pt.sha256
+
+USER 65534:65534
+EXPOSE 18000
+CMD ["python", "-m", "uvicorn", "api:app", "--host", "0.0.0.0", "--port", "18000", "--workers", "1", "--root-path", "/api", "--no-access-log", "--no-proxy-headers"]
+
+FROM runtime AS checks
+USER root
+RUN python -m pip install --target /tmp/test-deps pytest==9.2.0
+COPY pytest.ini assessment_api_client.py .env.example ./
+COPY tests/ ./tests/
+COPY deploy/car-damage-api.nginx.example.conf ./deploy/
+COPY ci/smoke_api_image.py ./ci/
+USER 65534:65534
+RUN PYTHONPATH=/app:/tmp/test-deps python -m pytest -q -p no:cacheprovider \
+    && PYTHONPATH=/app python ci/smoke_api_image.py \
+    && touch /tmp/car-damage-verified
+
+FROM runtime
+COPY --from=checks /tmp/car-damage-verified /app/.verified

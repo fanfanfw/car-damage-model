@@ -85,15 +85,27 @@ class TestHealth:
         assert response.status_code == 200
         assert response.json() == {"status": "ok"}
 
-    def test_ready_returns_200_when_ready(self):
+    def test_ready_uses_one_model_per_worker(self, monkeypatch):
         import api as api_module
 
-        api_module.CV_AVAILABLE = True
-        api_module.AGENT_AVAILABLE = True
-        client = TestClient(make_app())
-        response = client.get("/health/ready")
-        assert response.status_code == 200
-        assert response.json() == {"status": "ready"}
+        loads = []
+
+        class Detector:
+            device = "cpu"
+
+            def __init__(self, *args, **kwargs):
+                loads.append(self)
+
+            def detect_damage(self, image):
+                return {"damages": []}
+
+        monkeypatch.setattr(api_module, "CV_AVAILABLE", True)
+        monkeypatch.setattr(api_module, "CarDamageDetector", Detector, raising=False)
+        with TestClient(make_app()) as client:
+            assert client.get("/health/ready").json() == {"status": "ready"}
+            for _ in range(2):
+                assert _post(client).json()["cv_backend"] == "model-backed"
+            assert len(loads) == 1
 
     def test_ready_returns_503_when_not_ready(self):
         import api as api_module

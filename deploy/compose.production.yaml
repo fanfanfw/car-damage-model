@@ -1,0 +1,31 @@
+services:
+  api:
+    image: "${CAR_DAMAGE_IMAGE:?Set the approved Car Damage release pin}"
+    pull_policy: missing
+    runtime: nvidia
+    init: true
+    restart: unless-stopped
+    ports: ["127.0.0.1:18000:18000"]
+    environment:
+      ENVIRONMENT: production
+      AUTH_MODE: kong
+      ALLOWED_HOSTS: 127.0.0.1,car-damage.ifcontech.com
+      CAR_DAMAGE_REQUIRE_CUDA: "true"
+      NVIDIA_VISIBLE_DEVICES: "0"
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    read_only: true
+    tmpfs: ["/tmp:size=256m,mode=1777"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 2
+    mem_limit: 4g
+    pids_limit: 256
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18000/health/ready', timeout=5)"]
+      interval: 15s
+      timeout: 7s
+      retries: 4
+      start_period: 45s
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}

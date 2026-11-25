@@ -19,6 +19,7 @@ Usage:
 """
 
 import asyncio
+import hashlib
 import io
 import json
 import logging
@@ -91,6 +92,7 @@ except ImportError:
 
 try:
     from agentic.decision_agent import make_decision
+    from agentic.policy_loader import load_policy
 
     AGENT_AVAILABLE = True
     logger.info("Decision agent loaded successfully")
@@ -100,6 +102,8 @@ except ImportError:
 
 ASSESS_SCOPE = "car-damage:assess"
 ASSESS_TEMPLATE = "/assess"
+MODEL_PATH = PROJECT_ROOT / "models" / "best.pt"
+MODEL_CHECKSUM_PATH = MODEL_PATH.with_suffix(".pt.sha256")
 CHUNK_SIZE = 64 * 1024
 MIN_IMAGE_BYTES = 1000
 
@@ -561,6 +565,29 @@ def _demo_enabled(settings: Settings) -> bool:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     state = app.state._cd
+    if CV_AVAILABLE:
+        try:
+            from PIL import Image
+
+            production = state.settings.environment == "production"
+            if production:
+                expected = MODEL_CHECKSUM_PATH.read_text().split()[0]
+                with MODEL_PATH.open("rb") as model:
+                    if hashlib.file_digest(model, "sha256").hexdigest() != expected:
+                        raise ValueError("Checkpoint checksum mismatch")
+            detector = CarDamageDetector(str(MODEL_PATH), confidence_threshold=0.25, require_checkpoint=production)
+            if state.settings.require_cuda and detector.device != "cuda":
+                raise RuntimeError("CUDA device unavailable")
+            detector.detect_damage(Image.new("RGB", (64, 64)))
+            state.detector = detector
+            logger.info("assessment model warmup passed (device=%s)", detector.device)
+        except Exception as error:
+            logger.error("assessment model startup failed (error=%s)", type(error).__name__)
+    if AGENT_AVAILABLE:
+        try:
+            state.policy_ready = bool(load_policy(PROJECT_ROOT / "policies").rules)
+        except Exception as error:
+            logger.error("assessment policy startup failed (error=%s)", type(error).__name__)
     if state.settings.auth_mode == "control-plane":
         if state.auth_gateway is None:
             state.auth_gateway = AuthGateway(state.settings)
@@ -571,21 +598,23 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        state.detector = None
+        state.policy_ready = False
         if state.settings.auth_mode == "control-plane":
             await state.usage_gateway.stop()
             state.auth_gateway = None
             state.usage_gateway = None
 
 
-async def _run_detection(image_bytes: bytes, settings: Settings, assessment_id: str, request_id: str) -> tuple[list[dict], str]:
+async def _run_detection(image_bytes: bytes, state, assessment_id: str, request_id: str) -> tuple[list[dict], str]:
     """Run CV detection; returns (detections, cv_backend)."""
-    if CV_AVAILABLE:
+    settings = state.settings
+    if state.detector is not None:
         try:
             from PIL import Image as PILImage
 
-            detector = CarDamageDetector(confidence_threshold=0.25)
-            pil_img = PILImage.open(io.BytesIO(image_bytes))
-            result = detector.detect_damage(pil_img)
+            with PILImage.open(io.BytesIO(image_bytes)) as pil_img:
+                result = state.detector.detect_damage(pil_img)
             raw = result.get("damages", [])
             detections = []
             for det in raw:
@@ -663,6 +692,8 @@ def create_app(*, settings: Settings | None = None, auth_gateway=None, usage_gat
     state.settings = settings
     state.auth_gateway = auth_gateway
     state.usage_gateway = usage_gateway
+    state.detector = None
+    state.policy_ready = False
     state.rate_limiter = rate_limiter or FixedWindowRateLimiter()
     state.assess_semaphore = asyncio.Semaphore(settings.max_concurrent_assessments)
     application.state._cd = state
@@ -694,7 +725,8 @@ def _register_routes(application: FastAPI) -> None:
     @application.get("/health/ready", tags=["System"])
     async def health_ready():
         """Readiness: model and decision policy must be available."""
-        if CV_AVAILABLE and AGENT_AVAILABLE:
+        state = application.state._cd
+        if state.detector is not None and state.policy_ready:
             return {"status": "ready"}
         return JSONResponse(status_code=503, content={"status": "not_ready"})
 
@@ -784,7 +816,7 @@ def _register_routes(application: FastAPI) -> None:
                 validate_image(image_bytes, settings)
                 size_bucket = _size_bucket(len(image_bytes))
 
-                damages, cv_backend = await _run_detection(image_bytes, settings, assessment_id, request_id)
+                damages, cv_backend = await _run_detection(image_bytes, state, assessment_id, request_id)
                 decision_result, policy_version = await _run_decision(damages, settings, assessment_id, request_id)
             finally:
                 state.assess_semaphore.release()
