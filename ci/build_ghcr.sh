@@ -23,7 +23,7 @@ printf '%s\n' "${CI_COMMIT_SHA:-}" | grep -Eq '^[0-9a-f]{40}$' || {
   echo 'Missing Dockerfile.api or .dockerignore' >&2; exit 1;
 }
 export DOCKER_CONFIG="$(mktemp -d)"
-trap 'unlink "$DOCKER_CONFIG/config.json"; rmdir "$DOCKER_CONFIG"' EXIT HUP INT TERM
+trap 'unlink "$DOCKER_CONFIG/config.json"' EXIT
 umask 077
 auth="$(printf '%s:%s' "$GHCR_USERNAME" "$GHCR_PUSH_TOKEN" | base64 | tr -d '\n')"
 printf '{"auths":{"ghcr.io":{"auth":"%s"}}}\n' "$auth" > "$DOCKER_CONFIG/config.json"
