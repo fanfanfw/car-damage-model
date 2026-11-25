@@ -12,7 +12,8 @@ from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_ope
 DOKPLOY_URL = "http://100.64.0.13:3005/api"
 COMPOSE = "2Ga3dc2OpCu568hsGLvkS"
 SERVER = None
-BACKEND = "https://car-damage.ifcontech.com/api"
+BACKEND = "http://100.64.0.13:8080/api"
+BACKEND_HOST = "car-damage.ifcontech.com"
 TITLE_PREFIX = "car-damage-ci-"
 IMAGE_RE = r"ghcr\.io/fanfanfw/car-damage-api"
 PIN_RE = IMAGE_RE + r"@sha256:[0-9a-f]{64}"
@@ -86,7 +87,8 @@ def verify_backend(attempts=18):
     for _ in range(attempts):
         try:
             for path, status in (("/health/live", "ok"), ("/health/ready", "ready")):
-                with client.open(BACKEND + path, timeout=5) as response:
+                request = Request(BACKEND + path, headers={"Host": BACKEND_HOST})
+                with client.open(request, timeout=5) as response:
                     if response.status != 200 or json.load(response).get("status") != status:
                         break
             else:

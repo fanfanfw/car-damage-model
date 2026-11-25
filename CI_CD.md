@@ -33,8 +33,10 @@ Play `deploy-production` manually on the approved protected commit after the
 digest passes the GPU smoke. The job is available when the protected
 `CAR_DAMAGE_DEPLOY_ENABLED` variable equals `true`.
 
-The job records the old pin and waits for its own deployment. A terminal
-failure restores the old pin and checks readiness. An unknown deployment
+The job records the old pin, waits for its own deployment, and checks model
+readiness via Kong `.13` with the production Host. After promotion, verify
+public HTTPS and the Streamlit client. A terminal failure restores the old
+pin and checks readiness. An unknown deployment
 outcome requires checking the live Compose and image before queuing another
 release. The first promotion can roll back to the retained local bootstrap
 image `car-damage-api:bootstrap-09ae5c41b40a`. Gateway rollback on server-207
